@@ -44,8 +44,17 @@ echo "[entrypoint] Xvfb ready: ${ZS1_SCREEN_W}x${ZS1_SCREEN_H}"
 # A null sink is enough: nothing listens yet, but SDL needs a device to open or
 # it warns and runs silent, and the SPU's pacing loop is tuned against a device
 # that actually consumes samples. Failure here is not fatal.
-if pulseaudio --daemonize=yes --exit-idle-time=-1 2>/dev/null; then
-    pactl load-module module-null-sink sink_name=zs1 >/dev/null 2>&1 || true
+#
+# The sink is created at 48 kHz, the only rate Opus takes, so the one unavoidable
+# conversion (the SPU's 44.1 kHz to 48) happens in exactly one place: on the
+# emulator's stream as it enters the sink. Created without a rate, the sink came
+# up at the daemon's 44.1 kHz and was then reconfigured by whichever client
+# connected first, so where the conversion happened depended on start-up order.
+# speex-float-5 instead of the default speex-float-1 for that conversion: better
+# quality for a few percent of one core; soxr would be better still but can add
+# ~20 ms (pulse-daemon.conf(5)).
+if pulseaudio --daemonize=yes --exit-idle-time=-1 --resample-method=speex-float-5 2>/dev/null; then
+    pactl load-module module-null-sink sink_name=zs1 rate=48000 >/dev/null 2>&1 || true
     echo "[entrypoint] pulseaudio ready"
 else
     echo "[entrypoint] pulseaudio unavailable — running silent" >&2
@@ -84,11 +93,14 @@ if [ "${ZS1_AUDIO_STREAM:-1}" = "1" ]; then
             # a malformed one.
             #
             # Every other setting here trades bitrate or robustness for delay:
-            # a 480-frame pulse fragment is 10 ms of capture, lowdelay plus a
-            # 10 ms Opus frame keeps the encoder from looking ahead, and a
-            # 40 ms cluster is the smallest that still muxes cleanly.
+            # -fragment_size is in BYTES (ffmpeg-devices, pulse), so 1920 is
+            # 480 frames of s16 stereo, 10 ms at 48 kHz; it used to say 480,
+            # which is 2.5 ms and kept the null sink waking ~400 times a
+            # second. lowdelay drops Opus's extra 4 ms of encoder lookahead
+            # (2.5 ms remain) and a 10 ms frame keeps packetisation short, and
+            # a 40 ms cluster is the smallest that still muxes cleanly.
             ffmpeg -hide_banner -loglevel error -fflags nobuffer \
-                   -f pulse -fragment_size 480 -i zs1.monitor \
+                   -f pulse -fragment_size 1920 -i zs1.monitor \
                    -c:a libopus -b:a 96k -application lowdelay -frame_duration 10 \
                    -flush_packets 1 -cluster_time_limit 40 -max_delay 0 \
                    -content_type audio/webm -listen 1 -f webm -live 1 \

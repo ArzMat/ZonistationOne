@@ -80,6 +80,13 @@ spec:
             # ZS1_WEBRTC_BITRATE_KBPS raises it again on a local network.
             - name: ZS1_WEBRTC_BITRATE_KBPS
               value: "2500"
+            # Audio on the same WAN path: 20 ms Opus frames instead of 10 halve
+            # the packet rate and the header overhead (116 kbit/s on the wire
+            # instead of 136 for the same 96 kbit/s of payload) for 10 ms of
+            # delay, small next to the ~110 ms the emulator buffers itself.
+            # ZS1_WEBRTC_AUDIO_KBPS / _TYPE / _FEC are in webrtc_server.py.
+            - name: ZS1_WEBRTC_AUDIO_FRAME_MS
+              value: "20"
             - name: ZS1_WEBRTC_TURN_HOST
               valueFrom:
                 secretKeyRef: { name: zs1-turn, key: host }
@@ -91,6 +98,13 @@ spec:
             - { name: audio, containerPort: 6081 }
             - { name: webrtc, containerPort: 6082 }
           resources:
+            # A CPU request makes the pod Burstable instead of BestEffort, so the
+            # emulator, PulseAudio and the encoder get their share under node
+            # contention instead of being the first to starve; starving them is
+            # what turns into audio underruns and dropped audio buffers. No CPU
+            # limit: CFS throttling would cut a field short mid-frame.
+            requests:
+              cpu: "1"
             limits:
               nvidia.com/gpu: 1
           volumeMounts:
@@ -182,6 +196,8 @@ spec:
             # ZS1_WEBRTC_BITRATE_KBPS raises it again on a local network.
             - name: ZS1_WEBRTC_BITRATE_KBPS
               value: "2500"
+            - name: ZS1_WEBRTC_AUDIO_FRAME_MS
+              value: "20"
             - name: ZS1_WEBRTC_TURN_HOST
               valueFrom:
                 secretKeyRef: { name: zs1-turn, key: host }
@@ -193,6 +209,8 @@ spec:
             - { name: audio, containerPort: 6081 }
             - { name: webrtc, containerPort: 6082 }
           resources:
+            requests:
+              cpu: "1"
             limits:
               nvidia.com/gpu: 1
           volumeMounts:
@@ -293,6 +311,8 @@ spec:
             # ZS1_WEBRTC_BITRATE_KBPS raises it again on a local network.
             - name: ZS1_WEBRTC_BITRATE_KBPS
               value: "2500"
+            - name: ZS1_WEBRTC_AUDIO_FRAME_MS
+              value: "20"
             - name: ZS1_WEBRTC_TURN_HOST
               valueFrom:
                 secretKeyRef: { name: zs1-turn, key: host }
@@ -304,6 +324,8 @@ spec:
             - { name: audio, containerPort: 6081 }
             - { name: webrtc, containerPort: 6082 }
           resources:
+            requests:
+              cpu: "1"
             limits:
               nvidia.com/gpu: 1
           volumeMounts:

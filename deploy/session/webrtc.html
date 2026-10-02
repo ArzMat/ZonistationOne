@@ -27,6 +27,7 @@
   <span class="stat" id="s-fps"></span>
   <span class="stat" id="s-br"></span>
   <span class="stat" id="s-jit"></span>
+  <span class="stat" id="s-aud"></span>
   <span id="hint">Click the picture to send keys · arrows, Enter, Space, F5/F8</span>
 </div>
 
@@ -98,6 +99,23 @@ function wsURL() {
   return cred ? base.replace(/^(wss?:\/\/)/, '$1' + cred + '@') : base;
 }
 
+// Ask for stereo Opus in the answer. libwebrtc (Chrome, Edge) decodes Opus as
+// mono unless the answer's fmtp carries stereo=1
+// (api/audio_codecs/opus/audio_decoder_opus.cc), and createAnswer() does not put
+// it there; Firefox already does. The sender's sprop-stereo=1 is only a hint
+// that it will send two channels (RFC 7587), so without this Chrome folded the
+// SPU's stereo mix down to one channel.
+function preferStereo(sdp) {
+  const m = sdp.match(/a=rtpmap:(\d+) opus\/48000\/2/i);
+  if (!m) return sdp;
+  const pt = m[1];
+  const fmtp = new RegExp('a=fmtp:' + pt + ' ([^\\r\\n]*)');
+  if (fmtp.test(sdp))
+    return sdp.replace(fmtp, (line, p) => /stereo=/.test(p) ? line
+                                          : 'a=fmtp:' + pt + ' ' + p + ';stereo=1;sprop-stereo=1');
+  return sdp.replace(m[0], m[0] + '\r\na=fmtp:' + pt + ' stereo=1;sprop-stereo=1');
+}
+
 function connect() {
   const opened = { yes: false };
   ws = new WebSocket(wsURL());
@@ -146,7 +164,8 @@ function connect() {
       S('s-state').textContent = 'relay configured';
     } else if (m.sdp) {
       await pc.setRemoteDescription(m.sdp);
-      const answer = await pc.createAnswer();
+      const created = await pc.createAnswer();
+      const answer = { type: created.type, sdp: preferStereo(created.sdp) };
       await pc.setLocalDescription(answer);
       ws.send(JSON.stringify({ sdp: { type: answer.type, sdp: answer.sdp } }));
     } else if (m.ice) {
@@ -173,15 +192,37 @@ v.addEventListener('keyup',   e => key('up', e));
 
 // Reported, not estimated. round-trip time is the network leg only — encode and
 // decode sit on top of it — but it is the part that a stat can actually prove.
-let last = null;
+let last = null, lastAud = null;
 setInterval(async () => {
   if (!pc || pc.connectionState !== 'connected') return;
   const stats = await pc.getStats();
-  let inb = null, pair = null;
+  let inb = null, aud = null, pair = null;
   stats.forEach(r => {
     if (r.type === 'inbound-rtp' && r.kind === 'video') inb = r;
+    if (r.type === 'inbound-rtp' && r.kind === 'audio') aud = r;
     if (r.type === 'candidate-pair' && r.state === 'succeeded') pair = r;
   });
+  // Audio: what reached the wire (payload + RTP headers), the receiver's average
+  // jitter-buffer delay over the last second, the share of output that was
+  // concealment rather than received audio, and whether it decodes in stereo.
+  if (aud) {
+    if (lastAud) {
+      const dt = (aud.timestamp - lastAud.timestamp) / 1000;
+      const bytes = (aud.bytesReceived - lastAud.bytesReceived) +
+                    ((aud.headerBytesReceived || 0) - (lastAud.headerBytesReceived || 0));
+      const emitted = (aud.jitterBufferEmittedCount || 0) - (lastAud.jitterBufferEmittedCount || 0);
+      const jbMs = emitted > 0 ? ((aud.jitterBufferDelay - lastAud.jitterBufferDelay) / emitted) * 1000 : 0;
+      const got = (aud.totalSamplesReceived || 0) - (lastAud.totalSamplesReceived || 0);
+      const hid = (aud.concealedSamples || 0) - (lastAud.concealedSamples || 0);
+      const codec = aud.codecId ? stats.get(aud.codecId) : null;
+      const ch = codec && codec.channels ? (codec.channels === 2 ? 'stereo' : 'mono') : '?';
+      if (dt > 0)
+        S('s-aud').innerHTML = 'audio <b>' + (bytes * 8 / dt / 1e3).toFixed(0) + ' kbit/s</b> ' +
+          'jb <b>' + jbMs.toFixed(0) + ' ms</b> ' +
+          'plc <b>' + (got > 0 ? (100 * hid / got).toFixed(1) : '0.0') + '%</b> <b>' + ch + '</b>';
+    }
+    lastAud = aud;
+  }
   if (pair && pair.currentRoundTripTime != null)
     S('s-rtt').innerHTML = 'rtt <b>' + (pair.currentRoundTripTime*1000).toFixed(0) + ' ms</b>';
   if (inb) {

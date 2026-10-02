@@ -33,6 +33,59 @@ PORT     = int(os.environ.get("ZS1_WEBRTC_PORT", "6082"))
 DISPLAY  = os.environ.get("DISPLAY", ":0")
 SINK_MON = os.environ.get("ZS1_PULSE_MONITOR", "zs1.monitor")
 
+# Audio encoder settings, per session like the video bitrate above.
+#
+# Opus at 96 kbit/s is ~5% of a 2.5 Mbit/s WAN session, so the bitrate is not
+# where bandwidth goes; what matters on the wire is the packet rate. A 10 ms
+# frame sends 100 packets a second and pays ~42% in RTP/SRTP/UDP/IP headers
+# (136 kbit/s on the wire for 96 of payload); 20 ms halves both for 10 ms more
+# delay, which is small against the ~110 ms the emulator itself buffers.
+# The defaults keep today's behaviour; sessions.yaml picks 20 ms for the WAN.
+DEFAULT_AUDIO_FRAME_MS = "10"
+DEFAULT_AUDIO_TYPE = "restricted-lowdelay"
+AUDIO_KBPS = int(os.environ.get("ZS1_WEBRTC_AUDIO_KBPS", "96"))
+AUDIO_FRAME_MS = os.environ.get("ZS1_WEBRTC_AUDIO_FRAME_MS", DEFAULT_AUDIO_FRAME_MS)
+AUDIO_TYPE = os.environ.get("ZS1_WEBRTC_AUDIO_TYPE", DEFAULT_AUDIO_TYPE)
+AUDIO_FEC = os.environ.get("ZS1_WEBRTC_AUDIO_FEC", "0") == "1"
+AUDIO_LOSS_PCT = int(os.environ.get("ZS1_WEBRTC_AUDIO_LOSS_PCT", "5"))
+
+# The values opusenc's frame-size enum accepts (gst-inspect-1.0 opusenc, 1.24).
+OPUS_FRAME_SIZES = ("2.5", "5", "10", "20", "40", "60")
+# opusenc's audio-type enum: generic, voice, restricted-lowdelay.
+OPUS_AUDIO_TYPES = ("generic", "voice", "restricted-lowdelay")
+# Longest stall the audio queue absorbs before it starts dropping, in ns.
+AUDIO_QUEUE_NS = 60_000_000
+# How often a growing drop count is reported, in ms.
+AUDIO_DROP_REPORT_MS = 10_000
+BITS_PER_KBIT = 1000
+MS_PER_S = 1000
+
+
+def opus_encoder() -> str:
+    """
+    Build the opusenc element description from the ZS1_WEBRTC_AUDIO_* settings.
+
+    In-band FEC exists only in Opus's LPC (SILK) layer, and restricted-lowdelay
+    forces the CELT-only mode, so FEC asked for together with it would silently
+    do nothing (libopus include/opus_defines.h, OPUS_SET_INBAND_FEC). The type is
+    switched to generic in that case, and the switch is logged.
+
+    Returns:
+        The element text to place in the pipeline.
+    """
+    frame_ms = AUDIO_FRAME_MS if AUDIO_FRAME_MS in OPUS_FRAME_SIZES else DEFAULT_AUDIO_FRAME_MS
+    audio_type = AUDIO_TYPE if AUDIO_TYPE in OPUS_AUDIO_TYPES else DEFAULT_AUDIO_TYPE
+    if frame_ms != AUDIO_FRAME_MS or audio_type != AUDIO_TYPE:
+        log(f"audio: ignoring unsupported frame '{AUDIO_FRAME_MS}' or type '{AUDIO_TYPE}'")
+    if AUDIO_FEC and audio_type == "restricted-lowdelay":
+        log("audio: in-band FEC needs the SILK layer; using audio-type=generic")
+        audio_type = "generic"
+    element = (f"opusenc bitrate={AUDIO_KBPS * BITS_PER_KBIT} frame-size={frame_ms} "
+               f"audio-type={audio_type}")
+    if AUDIO_FEC:
+        element += f" inband-fec=true packet-loss-percentage={AUDIO_LOSS_PCT}"
+    return element
+
 # A relay, because the pipeline's own candidates go nowhere.
 #
 # The session runs on the k3d node's network, so every host candidate it gathers
@@ -87,11 +140,28 @@ else:
 # is 20 ms, so anything above it transmits duplicate frames and anything below it
 # drops real ones. gop-size follows at one keyframe a second.
 #
-# The queues are one buffer deep and leaky on the capture side. A deeper queue
-# would smooth a stall by adding delay, which is the opposite of what this is
-# for: when the encoder falls behind, the right answer is to drop the frame that
-# is already stale, not to show it late.
-PIPELINE = f"""
+# The video queues are one buffer deep and leaky on the capture side. A deeper
+# queue would smooth a stall by adding delay, which is the opposite of what this
+# is for: when the encoder falls behind, the right answer is to drop the frame
+# that is already stale, not to show it late.
+#
+# Audio is different: a dropped video frame is invisible, a dropped 10 ms of
+# sound is a click. Its queue used to be two buffers deep (20 ms), so any stall
+# longer than that (CPU contention, a slow DTLS write, Python's garbage
+# collector) discarded audio with nothing recording it. It now holds up to
+# AUDIO_QUEUE_NS of audio, still leaky so a long stall cannot turn into lasting
+# delay, and every drop is counted (see Session._on_audio_overrun).
+def build_pipeline(audio_encoder: str) -> str:
+    """
+    Assemble the webrtcbin pipeline description.
+
+    Args:
+        audio_encoder: The opusenc element text, from opus_encoder().
+
+    Returns:
+        The text handed to Gst.parse_launch().
+    """
+    return f"""
 webrtcbin name=sendrecv bundle-policy=max-bundle latency=0
 
 ximagesrc display-name={DISPLAY} use-damage=0 show-pointer=false
@@ -106,11 +176,11 @@ ximagesrc display-name={DISPLAY} use-damage=0 show-pointer=false
 
 pulsesrc device={SINK_MON} provide-clock=false
   ! audio/x-raw,channels=2,rate=48000
-  ! queue max-size-buffers=2 leaky=downstream
+  ! queue name=audioq leaky=downstream max-size-buffers=0 max-size-bytes=0 max-size-time={AUDIO_QUEUE_NS}
   ! audioconvert ! audioresample
-  ! opusenc bitrate=96000 frame-size=10 audio-type=restricted-lowdelay
+  ! {audio_encoder}
   ! rtpopuspay pt=97
-  ! queue max-size-buffers=2
+  ! queue max-size-buffers=0 max-size-bytes=0 max-size-time={AUDIO_QUEUE_NS}
   ! sendrecv.
 """
 
@@ -125,6 +195,9 @@ class Session:
         self.ws = None
         self.pipe = None
         self.webrtc = None
+        self.audio_drops = 0
+        self.audio_drops_reported = 0
+        self.drop_timer = 0
 
     # -- signalling out: called from the GLib thread, delivered on the asyncio one
     def _send(self, obj):
@@ -135,8 +208,14 @@ class Session:
 
     def start(self):
         self.stop()
-        self.pipe = Gst.parse_launch(PIPELINE)
+        audio_encoder = opus_encoder()
+        self.pipe = Gst.parse_launch(build_pipeline(audio_encoder))
         self.webrtc = self.pipe.get_by_name("sendrecv")
+        # A leaky queue drops in silence; "overrun" is emitted each time it is
+        # full when a buffer arrives, i.e. once per drop (checked against
+        # GStreamer 1.24 with a consumer slowed to a third of real time).
+        self.pipe.get_by_name("audioq").connect("overrun", self._on_audio_overrun)
+        self.drop_timer = GLib.timeout_add(AUDIO_DROP_REPORT_MS, self._report_audio_drops)
         if TURN_HOST and TURN_SECRET:
             from urllib.parse import quote
             user, pwd = turn_credentials()
@@ -152,7 +231,19 @@ class Session:
                     lambda _b, m: log("warning:", m.parse_warning()[0].message))
         bus.connect("message::state-changed", self._on_state)
         rc = self.pipe.set_state(Gst.State.PLAYING)
-        log(f"set_state(PLAYING) -> {rc.value_nick}; {FPS} fps, {BITRATE} kbps, {ENCODER}")
+        log(f"set_state(PLAYING) -> {rc.value_nick}; {FPS} fps, {BITRATE} kbps, {ENCODER}; "
+            f"audio {audio_encoder}")
+
+    def _on_audio_overrun(self, _queue):
+        # Streaming thread; a plain int increment is enough under the GIL.
+        self.audio_drops += 1
+
+    def _report_audio_drops(self) -> bool:
+        if self.audio_drops != self.audio_drops_reported:
+            log(f"audio: {self.audio_drops - self.audio_drops_reported} buffers dropped "
+                f"in the last {AUDIO_DROP_REPORT_MS // MS_PER_S} s ({self.audio_drops} total)")
+            self.audio_drops_reported = self.audio_drops
+        return True
 
     def _on_state(self, _bus, msg):
         if msg.src is self.pipe:
@@ -160,6 +251,9 @@ class Session:
             log(f"pipeline {old.value_nick} -> {new.value_nick}")
 
     def stop(self):
+        if self.drop_timer:
+            GLib.source_remove(self.drop_timer)
+            self.drop_timer = 0
         if self.pipe is not None:
             self.pipe.set_state(Gst.State.NULL)
             self.pipe = None

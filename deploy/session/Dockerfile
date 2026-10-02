@@ -23,6 +23,15 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
 # SDL3 is not packaged on Ubuntu 24.04, so it is built from source into
 # /usr/local exactly as on the development machine; the Makefile finds it
 # through pkg-config.
+#
+# 3.2.24 has a PulseAudio bug: after connecting it adopts fragsize instead of
+# tlength for a playback stream (src/audio/pulseaudio/SDL_pulseaudio.c:735), so
+# the emulator's 512-frame request comes back as buf=1024 in its "Audio:" log
+# line. 3.4.0 fixes that line, but measured against this pod's null sink it
+# reports buf=384 and PulseAudio's buffer latency for the stream goes from 6.6
+# to 9.6 ms, so moving to it is not a clear latency win; it also needs
+# libxcursor-dev and libxi-dev (and the other X11 -dev packages SDL lists) to
+# configure. Kept at 3.2.24 until that is measured end to end.
 ARG SDL_TAG=release-3.2.24
 RUN git clone --depth 1 --branch ${SDL_TAG} https://github.com/libsdl-org/SDL.git /tmp/SDL \
  && cmake -S /tmp/SDL -B /tmp/SDL/build -DCMAKE_BUILD_TYPE=Release \

@@ -560,9 +560,27 @@ static void log_sink_callback(int category, int level, const char* msg, void* ud
     if (comp.next_seq - comp.first_seq > LOG_RING_CAP)
         comp.first_seq = comp.next_seq - LOG_RING_CAP;
 
+    /* No flush here. The file is fully buffered (see debug_ui_init) and
+     * debug_ui_flush_logs() empties every buffer once per field, so a burst of
+     * DEBUG lines costs one write() per 64 KB instead of one per line. The
+     * file used to be line-buffered, which made every emitted line a syscall
+     * on the emulation thread. writes_since_flush only tells the per-field
+     * flush which files have anything to write. */
     if (comp.file) {
         fprintf(comp.file, "[%s] %s\n", level_name(level), msg);
-        if (++comp.writes_since_flush >= 64) {
+        comp.writes_since_flush++;
+    }
+}
+
+/* Called once per field from the host loop (main.c), after the frame has been
+ * submitted: the logs on disk are at most one field behind the machine, which
+ * is the granularity anyone reading them can use, and the crash handlers in
+ * main.c flush whatever is still buffered on the way out. Takes the same lock
+ * the sink does, so a line the GPU thread is writing is never cut in half. */
+extern "C" void debug_ui_flush_logs(void) {
+    std::lock_guard<std::mutex> lock(g_log_mutex);
+    for (auto& comp : g_log_components) {
+        if (comp.file && comp.writes_since_flush) {
             fflush(comp.file);
             comp.writes_since_flush = 0;
         }
@@ -660,7 +678,7 @@ static const char* level_name(int level) {
  * log; the snapshot is a separate artefact and now says so in its name.
  *
  * The handle is flushed first, so the two files line up at the moment of the
- * snapshot instead of the streamed one trailing by up to 64 lines. */
+ * snapshot instead of the streamed one trailing by up to a field's lines. */
 static void export_component_log(LogComponent& comp) {
     mkdir("logs", 0755);
     char path[160];
@@ -3492,7 +3510,13 @@ extern "C" void debug_ui_init(SDL_Window* window, void* gl_context, int backend)
         snprintf(path, sizeof(path), "logs/%s.log", comp.name);
         comp.file = fopen(path, "w");
         if (comp.file) {
-            setvbuf(comp.file, NULL, _IOLBF, 4096);
+            /* Fully buffered, 64 KB. Line buffering turned every emitted line
+             * into a write() on whichever thread logged it; at DEBUG that is
+             * thousands of syscalls per field on the emulation thread. The
+             * buffer is emptied once per field (debug_ui_flush_logs) and by
+             * the signal handlers in main.c, so a crash or a Ctrl+C still
+             * leaves everything up to the last field on disk. */
+            setvbuf(comp.file, NULL, _IOFBF, 64 * 1024);
         }
     }
 

@@ -43,6 +43,10 @@
 
 /* From debug_ui.cpp — returns ImDrawData* after ImGui::Render() */
 extern void* debug_ui_get_draw_data(void);
+/* From debug_ui.cpp: empties the per-category log files' stdio buffers. They
+ * are fully buffered, and this is the once-per-field point where they reach
+ * the disk (the crash handlers below cover the rest). */
+extern void debug_ui_flush_logs(void);
 
 /* Emulated-frame length and host frame pacing both follow the GPU's video mode
  * (gpu_cycles_per_frame): 566203 cy / 59.82 Hz NTSC, 680823 cy / 49.75 Hz PAL.
@@ -401,10 +405,40 @@ static SDL_AudioStream* g_audio_stream = NULL;
 // --- Exec trace on forced shutdown ---
 static const Cpu* g_cpu_for_trace = NULL;
 
+/* Ctrl+C, kill, abort(): dump the trace and leave.
+ *
+ * The per-category log files are fully buffered now (debug_ui.cpp), so the
+ * lines since the last per-field flush are still in memory when a signal
+ * arrives, and _exit(), unlike exit(), does not flush stdio. fflush(NULL)
+ * writes every open stream out first. Neither fflush nor the fopen/fprintf in
+ * cpu_dump_exec_trace is async-signal-safe; this handler already relied on
+ * that working for the trace dump, and on the way out it is the right trade. */
 static void sighandler_dump_trace(int sig) {
     (void)sig;
     if (g_cpu_for_trace) cpu_dump_exec_trace(g_cpu_for_trace, "logs/exec_trace.log");
+    fflush(NULL);
     _exit(1);
+}
+
+/* A real crash: SIGSEGV, SIGBUS, SIGFPE, SIGILL.
+ *
+ * There was no handler for these, which was harmless while the log files were
+ * line-buffered: every line was on disk the moment it was written. With full
+ * buffering a segfault would lose the last field of log, which is precisely
+ * the part that explains the segfault. So: dump the trace, flush, then put the
+ * default action back and re-raise, so the process still dies of the signal it
+ * got (exit status, core dump) rather than of a polite _exit(1).
+ *
+ * The default action goes back first thing, and the signal stays blocked while
+ * the handler runs (no SA_NODEFER), so a second fault in here is fatal at once
+ * instead of recursing; the raise() at the end is held until the handler
+ * returns and then takes the default action. (SA_RESETHAND would say the same
+ * thing but is XSI, hidden by this file's _POSIX_C_SOURCE.) */
+static void sighandler_fatal(int sig) {
+    signal(sig, SIG_DFL);
+    if (g_cpu_for_trace) cpu_dump_exec_trace(g_cpu_for_trace, "logs/exec_trace.log");
+    fflush(NULL);
+    raise(sig);
 }
 
 /* SDL3 has no fill-this-buffer device callback: audio goes through an
@@ -596,6 +630,13 @@ int main(int argc, char* argv[]) {
             else if (!strcmp(lvl, "trace"))  log_set_level(LOG_LEVEL_TRACE);
         }
     }
+    /* The runtime level can only reach what the build compiled in: lines above
+     * ZS1_LOG_MAX_LEVEL are gone from the binary (include/log.h). Say so rather
+     * than leave a trace run wondering why it is silent. */
+    if ((int)log_get_current_level() > (int)ZS1_LOG_MAX_LEVEL)
+        LOG_SYSTEM_WARN("[SYSTEM] Log level %d requested but this build compiles out every line "
+                        "above level %d; rebuild with `make LOG_MAX_LEVEL=TRACE` to get TRACE lines",
+                        (int)log_get_current_level(), (int)ZS1_LOG_MAX_LEVEL);
     LOG_SYSTEM_INFO("[SYSTEM] ZoniStation One starting — BIOS: %s", args.bios_path);
 
     /* Not const: the quick menu's Video panel can change it while the machine
@@ -607,6 +648,21 @@ int main(int argc, char* argv[]) {
     if (!init_sdl(&sdl, backend)) return 1;
 
     debug_ui_init(sdl.win, sdl.ctx, (int)backend);
+
+    /* The crash handlers go in as soon as the log files exist (debug_ui_init
+     * opens them), so a fault in renderer or device bring-up still leaves its
+     * last lines on disk. The trace dump inside them waits for g_cpu_for_trace. */
+    {
+        struct sigaction sa;
+        memset(&sa, 0, sizeof(sa));
+        sa.sa_handler = sighandler_fatal;
+        sa.sa_flags   = 0;
+        sigemptyset(&sa.sa_mask);
+        sigaction(SIGSEGV, &sa, NULL);
+        sigaction(SIGBUS,  &sa, NULL);
+        sigaction(SIGFPE,  &sa, NULL);
+        sigaction(SIGILL,  &sa, NULL);
+    }
 
     // --- Component init ---
     // static: these structs are multi-MB (Bios 512KB, Ram 2MB, Interconnect ~3.4MB) —
@@ -933,6 +989,7 @@ int main(int argc, char* argv[]) {
 
         /* Submit frame to GPU thread: swap buffers, wake renderer */
         renderer_submit_frame(&inter.gpu.renderer, debug_ui_get_draw_data());
+        debug_ui_flush_logs();
         if (s_prof) {
             t4 = SDL_GetPerformanceCounter();
             extern uint64_t g_spu_gen_ticks;

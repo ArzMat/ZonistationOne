@@ -73,6 +73,15 @@ static void begin_reading(Cdrom *cdrom) {
         location_changed      = (cdrom->setloc_lba != cdrom->current_lba);
         cdrom->current_lba    = cdrom->setloc_lba;
         cdrom->setloc_pending = false;
+    } else if (cdrom->drive_state == DRIVE_IDLE || cdrom->drive_state == DRIVE_PAUSING) {
+        /* No Setloc pending and no read in progress: "If Reading was Paused,
+         * then reading resumes at the most recently received sector (ie.
+         * returning that sector once another time)" (psx-spx
+         * cdr/cdromdrive.md:811-814). That is head_lba, the last sector
+         * transferred. It used to resume one past it. After a SeekL the two
+         * are the same sector, so a Setloc/SeekL/ReadN sequence is unchanged.
+         * A Read while reading "just continues reading" (:811-812). */
+        cdrom->current_lba = cdrom->head_lba;
     }
     LOG_CDROM_DEBUG("[CDROM] Drive state: %s -> READING (LBA %u)",
                     cdrom_drive_state_name(cdrom->drive_state), cdrom->current_lba);
@@ -815,49 +824,150 @@ void cdrom_execute_second_response(Cdrom *cdrom) {
  * Drive Loop (sector reading / CDDA playing)
  * ========================================================================= */
 
-void cdrom_execute_drive(Cdrom *cdrom) {
+/* ZS1_CD_XA_HOLD=1: the drive waits for every acknowledge, XA included (see
+ * cdrom_drive_event_tick). Read once. */
+bool cdrom_xa_hold_legacy(void) {
+    static int s_hold = -1;
+    if (s_hold < 0) {
+        const char *env = getenv("ZS1_CD_XA_HOLD");
+        s_hold = (env && env[0] == '1') ? 1 : 0;
+        if (s_hold)
+            LOG_CDROM_INFO("[CDROM] ZS1_CD_XA_HOLD=1: XA sectors wait for interrupt acknowledges");
+    }
+    return s_hold == 1;
+}
+
+/* Where a sector read by ReadN/ReadS goes. "The PSX CDROM BIOS is first trying
+ * to send sectors to the ADPCM decoder, and, if that didn't work out, then it's
+ * trying to send them to the main CPU (and if that didn't work out either, then
+ * it's silently ignoring the sector)" (psx-spx cdr/cdromdrive.md:590-593):
+ *
+ *   try_deliver_as_adpcm_sector:                                   (:595-601)
+ *    reject if CD-DA AUDIO format
+ *    reject if sector isn't MODE2 format
+ *    reject if adpcm_disabled(setmode.6)
+ *    reject if filter_enabled(setmode.3) AND selected file/channel doesn't match
+ *    reject if submode isn't audio+realtime (bit2 and bit6 must be both set)
+ *   try_deliver_as_data_sector:                                    (:602-608)
+ *    reject if filter_enabled(setmode.3) AND submode is audio+realtime
+ *    1st delivery attempt: send INT1+data, unless there's another INT pending
+ *
+ * The code this replaces skipped the first two ADPCM checks, so a Mode 1 sector
+ * whose bytes 16-19 happened to look like an audio subheader went to the
+ * decoder; and it had no DISCARD at all. Every audio sector of another
+ * file/channel became an INT1 with ADPCM in the data FIFO and moved the GetlocL
+ * location onto a channel the game was not playing. An FMV, with one audio
+ * channel and a demuxer that skips sectors without a video header, never
+ * noticed; an XA bank of dialogue, 8 to 32 channels in one file
+ * (cdr/cdromformat.md:698), got N-1 spurious INT1s in N.
+ *
+ * The subheader exists only on a Mode 2 sector (bytes 10h-13h, cdr/
+ * cdromformat.md:486-503; a Mode 1 sector has user data there, :477-485), so
+ * "audio+realtime" (submode bits 2 and 6, :643-653) is read from byte 18 only
+ * there; a CD-DA or Mode 1 sector never counts as audio.
+ * The second, file/channel-checked data delivery attempt (:606-612) is not
+ * modelled, as before. */
+CdromSectorRoute cdrom_route_sector(const uint8_t *raw, bool cdda_sector,
+                                    bool adpcm_enable, bool filter_enable,
+                                    uint8_t filter_file, uint8_t filter_channel) {
+    bool mode2    = !cdda_sector && raw[15] == 2;
+    bool audio_rt = mode2 && (raw[18] & 0x44) == 0x44;
+    bool fc_match = raw[16] == filter_file && raw[17] == filter_channel;
+
+    if (mode2 && adpcm_enable && (!filter_enable || fc_match) && audio_rt)
+        return CDROM_ROUTE_ADPCM;
+    if (filter_enable && audio_rt)
+        return CDROM_ROUTE_DISCARD;
+    return CDROM_ROUTE_DATA;
+}
+
+/* Whether `lba` lies on a CD-DA track: such a sector carries audio samples,
+ * not a header and subheader. */
+static bool cdrom_lba_is_cdda(Cdrom *cdrom, uint32_t lba) {
+    if (!cdrom->disc_present || cdrom->disc.last_track == 0) return false;
+    uint8_t trk = cdrom_disc_get_track_at_lba(&cdrom->disc, lba);
+    return trk >= cdrom->disc.first_track && trk <= cdrom->disc.last_track &&
+           cdrom->disc.tracks[trk].is_audio;
+}
+
+/* After a sector the drive does not hand to the CPU: the head moves on, and the
+ * drive schedules itself one sector period later, since no INT1 acknowledge
+ * will do it. */
+static void cdrom_drive_advance_unsignalled(Cdrom *cdrom) {
+    cdrom->head_lba = cdrom->current_lba;   /* the sector just transferred */
+    cdrom->current_lba++;
     if (cdrom->drive_state == DRIVE_READING) {
-        /* Retrieve sector from async reader */
-        uint8_t raw[2352];
-        CdromSectorStatus st = cdrom_async_reader_poll(&cdrom->async_reader, raw,
-                                                       cdrom->current_lba);
-        if (st == CDROM_SECTOR_PENDING) {
-            /* The disc has not delivered yet. Waiting here stopped the whole
-             * emulation thread on real file I/O: a seek to a cold part of a
-             * 580 MB image froze it for 115-232ms, which is a dropped frame and
-             * an audible gap in an audio ring that holds about 55ms. Come back
-             * shortly instead — the drive is late, not the machine. */
-            cdrom_schedule_drive_event(cdrom, CDROM_READ_RETRY_DELAY);
-            return;
-        }
-        if (st == CDROM_SECTOR_FAILED) {
-            /* No-disc → NOT_READY (0x80): BIOS retries. Disc error → SEEK_ERROR (0x04): BIOS aborts. */
-            uint8_t err_reason = cdrom->disc_present ? 0x04 : 0x80;
-            LOG_CDROM_DEBUG("[CDROM] Read failed at LBA %u (disc_present=%d, err=0x%02x)",
-                            cdrom->current_lba, cdrom->disc_present, err_reason);
-            cdrom_send_error(cdrom, cdrom_get_stat_byte(cdrom) | STAT_BYTE_ERROR, err_reason);
-            cdrom->drive_state = DRIVE_IDLE;
-            return;
-        }
+        cdrom_async_reader_queue(&cdrom->async_reader, cdrom->current_lba);
+        uint32_t delay = cdrom->double_speed ? CDROM_READ_DELAY_2X : CDROM_READ_DELAY_1X;
+        cdrom_schedule_drive_event(cdrom, delay);
+    }
+}
 
-        /* The head has reached the sector, so the implicit seek that started
-         * this read is over and GetlocL/Pause answer normally again
-         * (cdromdrive.md:896-901, :586-588). */
-        cdrom->seek_phase = false;
+/* One sector under the head while reading. With `int_pending`, an interrupt is
+ * still unacknowledged: ADPCM and discarded sectors go ahead, a data sector is
+ * held where it is (see cdrom_drive_event_tick). */
+static void cdrom_drive_read_sector(Cdrom *cdrom, bool int_pending) {
+    uint8_t raw[2352];
+    CdromSectorStatus st = cdrom_async_reader_poll(&cdrom->async_reader, raw,
+                                                   cdrom->current_lba);
+    if (st == CDROM_SECTOR_PENDING) {
+        /* The disc has not delivered yet. Waiting here stopped the whole
+         * emulation thread on real file I/O: a seek to a cold part of a
+         * 580 MB image froze it for 115-232ms, which is a dropped frame and
+         * an audible gap in an audio ring that holds about 55ms. Come back
+         * shortly instead: the drive is late, not the machine. */
+        cdrom_schedule_drive_event(cdrom, CDROM_READ_RETRY_DELAY);
+        return;
+    }
+    if (st == CDROM_SECTOR_FAILED) {
+        /* The error is an interrupt as well; with one pending it waits for the
+         * acknowledge like data (the re-armed event reads the sector again). */
+        if (int_pending) return;
+        /* No-disc → NOT_READY (0x80): BIOS retries. Disc error → SEEK_ERROR (0x04): BIOS aborts. */
+        uint8_t err_reason = cdrom->disc_present ? 0x04 : 0x80;
+        LOG_CDROM_DEBUG("[CDROM] Read failed at LBA %u (disc_present=%d, err=0x%02x)",
+                        cdrom->current_lba, cdrom->disc_present, err_reason);
+        cdrom_send_error(cdrom, cdrom_get_stat_byte(cdrom) | STAT_BYTE_ERROR, err_reason);
+        cdrom->drive_state = DRIVE_IDLE;
+        return;
+    }
 
-        /* Write into ring buffer */
-        uint8_t widx = cdrom->current_write_buffer;
-        SectorBuffer *sb = &cdrom->sector_buffers[widx];
-        memcpy(sb->raw, raw, 2352);
-        sb->lba   = cdrom->current_lba;
-        sb->valid = true;
+    CdromSectorRoute route = cdrom_route_sector(raw, cdrom_lba_is_cdda(cdrom, cdrom->current_lba),
+                                                cdrom->xa_adpcm_enable, cdrom->xa_filter_enable,
+                                                cdrom->xa_filter_file, cdrom->xa_filter_channel);
+    if (route == CDROM_ROUTE_DATA && int_pending) {
+        /* "send INT1+data, unless there's another INT pending" (:605). The
+         * sector stays at the head; drive_deadline still says when it was due,
+         * and the acknowledge re-arms on what is left of that. */
+        cdrom_async_reader_unpoll(&cdrom->async_reader, cdrom->current_lba);
+        return;
+    }
 
-        cdrom->sectors_read_total++;
+    /* The head has reached the sector, so the implicit seek that started
+     * this read is over and GetlocL/Pause answer normally again
+     * (cdromdrive.md:896-901, :586-588). */
+    cdrom->seek_phase = false;
+    cdrom->sectors_read_total++;
 
-        /* Check XA subheader: submode byte at offset 18 */
-        uint8_t submode = raw[18];
-        bool is_xa_audio = (submode & 0x04) != 0;  /* bit 2 = AUDIO */
-        bool is_realtime = (submode & 0x40) != 0;  /* bit 6 = REALTIME */
+    /* Position, for every sector the head passes, not only the ones delivered
+     * as data: GetlocP "Retrieves 8 bytes of position information from
+     * Subchannel Q" (cdromdrive.md:904-905), and the subchannel runs under XA
+     * and filtered sectors too. This was updated in the data branch alone, and
+     * GetlocP only kept moving during XA because the other channels' sectors
+     * wrongly went that way.
+     *
+     * Not for a LibCrypt sector, whose Q carries a deliberately wrong CRC. The
+     * controller discards such a sector's Q entirely and GetlocP keeps
+     * answering with the previous one (cdromformat.md, CDROM Protection -
+     * LibCrypt); that repeat is exactly the signal the protection counts, so
+     * handing the guest the modified values instead produced a wrong 16-bit
+     * key and Dino Crisis (E) walked into its own `j $` trap at 0x80029778. */
+    if (!cdrom_disc_sbi_covers(&cdrom->disc, cdrom->current_lba)) {
+        cdrom->current_subq_lba = cdrom->current_lba;
+        cdrom->last_subq = cdrom_disc_get_subq(&cdrom->disc, cdrom->current_lba);
+    }
+
+    if (route == CDROM_ROUTE_ADPCM) {
         /* Coding info (DOCS/cdromformat.md:664-671, DOCS/cdromdrive.md:265-278):
          *   bits 0-1  mono / stereo
          *   bit  2    sample rate, 0 = 37800 Hz, 1 = 18900 Hz
@@ -868,135 +978,150 @@ void cdrom_execute_drive(Cdrom *cdrom) {
         bool xa_stereo   = (coding & 0x01) != 0;
         bool xa_18900    = (coding & 0x04) != 0;
         bool xa_8bit     = (coding & 0x10) != 0;
-        bool file_match  = !cdrom->xa_filter_enable
-                           || (raw[16] == cdrom->xa_filter_file
-                               && raw[17] == cdrom->xa_filter_channel);
 
-        if (cdrom->xa_adpcm_enable && is_xa_audio && is_realtime && file_match) {
-            cdrom->xa_sectors_total++;
-            /* Which (file, channel) the decoder is actually being fed. An XA file
-             * interleaves several channels, and the decoder carries its ADPCM
-             * filter state across sectors — so accepting two channels splices
-             * unrelated audio into one stream and the state runs on from the wrong
-             * predecessor. Logged only when the pair changes, which is silent on a
-             * correctly filtered stream and noisy on the failure. */
-            /* Sector sequence. The ADPCM filter is an IIR whose state carries
-             * from one sector into the next, so a skipped or repeated sector does
-             * not merely lose a moment of audio — it restarts the filter from the
-             * wrong predecessor, and the error rings on until the signal decays.
-             * XA sectors of one channel arrive interleaved with other channels'
-             * sectors, so the LBA step is the interleave factor and what matters
-             * is that it stays *constant*, not that it is 1. */
-            {
-                static uint32_t s_prev_lba = 0;
-                static int32_t  s_step = 0;
-                static uint32_t s_breaks = 0;
-                if (s_prev_lba) {
-                    int32_t d = (int32_t)cdrom->current_lba - (int32_t)s_prev_lba;
-                    if (s_step == 0) {
-                        s_step = d;
-                        LOG_CDROM_INFO("[CDROM] XA interleave step = %d sectors", d);
-                    } else if (d != s_step) {
-                        s_breaks++;
-                        LOG_CDROM_WARN("[CDROM] XA sequence break #%u at LBA %u: step %d, expected %d",
-                                       s_breaks, cdrom->current_lba, d, s_step);
-                    }
-                }
-                s_prev_lba = cdrom->current_lba;
-            }
-            {
-                static int  s_last_file = -1, s_last_ch = -1;
-                static uint32_t s_switches = 0;
-                if (raw[16] != s_last_file || raw[17] != s_last_ch) {
-                    s_switches++;
-                    LOG_CDROM_INFO("[CDROM] XA stream now file=%u channel=%u "
-                                   "(filter %s, want file=%u channel=%u) — switch #%u at LBA %u",
-                                   raw[16], raw[17],
-                                   cdrom->xa_filter_enable ? "on" : "OFF",
-                                   cdrom->xa_filter_file, cdrom->xa_filter_channel,
-                                   s_switches, cdrom->current_lba);
-                    s_last_file = raw[16];
-                    s_last_ch   = raw[17];
+        cdrom->xa_sectors_total++;
+        /* Sector sequence. The ADPCM filter is an IIR whose state carries
+         * from one sector into the next, so a skipped or repeated sector does
+         * not merely lose a moment of audio: it restarts the filter from the
+         * wrong predecessor, and the error rings on until the signal decays.
+         * XA sectors of one channel arrive interleaved with other channels'
+         * sectors, so the LBA step is the interleave factor and what matters
+         * is that it stays *constant*, not that it is 1. */
+        {
+            static uint32_t s_prev_lba = 0;
+            static int32_t  s_step = 0;
+            static uint32_t s_breaks = 0;
+            if (s_prev_lba) {
+                int32_t d = (int32_t)cdrom->current_lba - (int32_t)s_prev_lba;
+                if (s_step == 0) {
+                    s_step = d;
+                    LOG_CDROM_INFO("[CDROM] XA interleave step = %d sectors", d);
+                } else if (d != s_step) {
+                    s_breaks++;
+                    LOG_CDROM_WARN("[CDROM] XA sequence break #%u at LBA %u: step %d, expected %d",
+                                   s_breaks, cdrom->current_lba, d, s_step);
                 }
             }
-            /* XA-ADPCM sector: decode to audio FIFO — NO INT1 */
-            cdrom_audio_decode_xa(&cdrom->xa_adpcm_state, &cdrom->audio_fifo,
-                                   raw + 24, xa_stereo, xa_8bit, xa_18900);
-
-            cdrom->head_lba = cdrom->current_lba;   /* the sector just transferred */
-            cdrom->current_lba++;
-            if (cdrom->drive_state == DRIVE_READING) {
-                cdrom_async_reader_queue(&cdrom->async_reader, cdrom->current_lba);
-                /* No INT1 → must self-schedule next drive event */
-                uint32_t delay = cdrom->double_speed ? CDROM_READ_DELAY_2X : CDROM_READ_DELAY_1X;
-                cdrom_schedule_drive_event(cdrom, delay);
-            }
-        } else {
-            /* What GetlocL answers with, latched here rather than read back out
-             * of the ring below: the ring entry is cleared once the guest has
-             * DMA'd the sector out, and GetlocL is asked *after* that, so
-             * answering from the ring failed on every sector the game had
-             * already consumed — Monsters & Co. then loops for good, re-issuing
-             * Setloc/SeekL/GetlocL/ReadS twice a field waiting for a location it
-             * never gets ("new game hangs").
-             *
-             * Only data sectors latch. A reference run over an XA section
-             * interleaved 1 data : 3 audio answers GetlocL with the data
-             * cadence — MSF stepping by exactly 4 — so the ADPCM sectors that
-             * pass to the audio decoder never become the reported location.
-             * Latching those as well takes the game's demuxer off the video
-             * stream and its speech never plays. */
-            memcpy(cdrom->last_header, raw + 12, 8);
-            cdrom->last_header_valid = true;
-
-            /* Data sector: sector size from mode bits 4-5 (nocash PSX-SPX) */
-            if (cdrom->mode & 0x20) {       /* bit5: 2340 bytes from sync header */
-                sb->data_start = 12;
-                sb->data_size  = 2340;
-            } else if (cdrom->mode & 0x10) { /* bit4: 2328 bytes (with subheader, no sync) */
-                sb->data_start = 24;
-                sb->data_size  = 2328;
-            } else {                         /* default: 2048 user data */
-                sb->data_start = 24;
-                sb->data_size  = 2048;
-            }
-            sb->position = 0;
-
-            cdrom->current_read_buffer  = widx;
-            cdrom->current_write_buffer = (widx + 1) % CDROM_SECTOR_BUFFERS;
-
-            /* Update SubQ — unless this is a LibCrypt sector, whose Q carries
-             * a deliberately wrong CRC. The controller discards such a sector's
-             * Q entirely and GetlocP keeps answering with the previous one
-             * (cdromformat.md, CDROM Protection - LibCrypt); that repeat is
-             * exactly the signal the protection counts, so handing the guest
-             * the modified values instead produced a wrong 16-bit key and Dino
-             * Crisis (E) walked into its own `j $` trap at 0x80029778. */
-            if (!cdrom_disc_sbi_covers(&cdrom->disc, cdrom->current_lba)) {
-                cdrom->current_subq_lba = cdrom->current_lba;
-                cdrom->last_subq = cdrom_disc_get_subq(&cdrom->disc, cdrom->current_lba);
-            }
-
-            LOG_CDROM_DEBUG("[CDROM] Sector LBA=%u -> INT1", cdrom->current_lba);
-
-            /* INT1: data ready. The ACK handler re-arms the drive event, but the
-             * deadline is set here, when this sector was delivered: the head
-             * reaches the next one a sector period later whatever the guest does
-             * with the interrupt. */
-            if (cdrom->inter)
-                cdrom->drive_deadline = cdrom->inter->cpu_cycle_counter +
-                    (cdrom->double_speed ? CDROM_READ_DELAY_2X : CDROM_READ_DELAY_1X);
-            fifo_clear(&cdrom->response_fifo);
-            cdrom_push_response(cdrom, cdrom_get_stat_byte(cdrom));
-            cdrom->interrupt_flag = CDROM_INT_DATA_READY;
-            if (cdrom->inter) interconnect_trigger_cdrom_irq(cdrom->inter);
-            lua_debug_notify("cdrom_int1");
-
-            cdrom->head_lba = cdrom->current_lba;   /* the sector just transferred */
-            cdrom->current_lba++;
-            if (cdrom->drive_state == DRIVE_READING)
-                cdrom_async_reader_queue(&cdrom->async_reader, cdrom->current_lba);
+            s_prev_lba = cdrom->current_lba;
         }
+        /* Which (file, channel) the decoder is actually being fed. An XA file
+         * interleaves several channels, and the decoder carries its ADPCM
+         * filter state across sectors, so accepting two channels splices
+         * unrelated audio into one stream and the state runs on from the wrong
+         * predecessor. Logged only when the pair changes, which is silent on a
+         * correctly filtered stream and noisy on the failure. */
+        {
+            static int  s_last_file = -1, s_last_ch = -1;
+            static uint32_t s_switches = 0;
+            if (raw[16] != s_last_file || raw[17] != s_last_ch) {
+                s_switches++;
+                LOG_CDROM_INFO("[CDROM] XA stream now file=%u channel=%u "
+                               "(filter %s, want file=%u channel=%u), switch #%u at LBA %u",
+                               raw[16], raw[17],
+                               cdrom->xa_filter_enable ? "on" : "OFF",
+                               cdrom->xa_filter_file, cdrom->xa_filter_channel,
+                               s_switches, cdrom->current_lba);
+                s_last_file = raw[16];
+                s_last_ch   = raw[17];
+            }
+        }
+        /* XA-ADPCM sector: decode to audio FIFO, NO INT1 (:1132-1133). */
+        cdrom_audio_decode_xa(&cdrom->xa_adpcm_state, &cdrom->audio_fifo,
+                               raw + 24, xa_stereo, xa_8bit, xa_18900);
+        cdrom_drive_advance_unsignalled(cdrom);
+        return;
+    }
+
+    if (route == CDROM_ROUTE_DISCARD) {
+        /* An audio sector of another file/channel with the filter on: no INT1,
+         * no data buffer, no GetlocL latch (:604). */
+        LOG_CDROM_DEBUG("[CDROM] Sector LBA=%u discarded by the XA filter (file=%u ch=%u, want %u/%u)",
+                        cdrom->current_lba, raw[16], raw[17],
+                        cdrom->xa_filter_file, cdrom->xa_filter_channel);
+        cdrom_drive_advance_unsignalled(cdrom);
+        return;
+    }
+
+    /* Data sector. */
+
+    /* What GetlocL answers with, latched here rather than read back out
+     * of the ring below: the ring entry is cleared once the guest has
+     * DMA'd the sector out, and GetlocL is asked *after* that, so
+     * answering from the ring failed on every sector the game had
+     * already consumed. Monsters & Co. then loops for good, re-issuing
+     * Setloc/SeekL/GetlocL/ReadS twice a field waiting for a location it
+     * never gets ("new game hangs").
+     *
+     * Only data sectors latch. A reference run over an XA section
+     * interleaved 1 data : 3 audio answers GetlocL with the data
+     * cadence, MSF stepping by exactly 4, so the ADPCM sectors that
+     * pass to the audio decoder never become the reported location.
+     * Latching those as well takes the game's demuxer off the video
+     * stream and its speech never plays. */
+    memcpy(cdrom->last_header, raw + 12, 8);
+    cdrom->last_header_valid = true;
+
+    /* Write into ring buffer */
+    uint8_t widx = cdrom->current_write_buffer;
+    SectorBuffer *sb = &cdrom->sector_buffers[widx];
+    memcpy(sb->raw, raw, 2352);
+    sb->lba   = cdrom->current_lba;
+    sb->valid = true;
+
+    /* Data sector: sector size from mode bits 4-5 (nocash PSX-SPX) */
+    if (cdrom->mode & 0x20) {       /* bit5: 2340 bytes from sync header */
+        sb->data_start = 12;
+        sb->data_size  = 2340;
+    } else if (cdrom->mode & 0x10) { /* bit4: 2328 bytes (with subheader, no sync) */
+        sb->data_start = 24;
+        sb->data_size  = 2328;
+    } else {                         /* default: 2048 user data */
+        sb->data_start = 24;
+        sb->data_size  = 2048;
+    }
+    sb->position = 0;
+
+    cdrom->current_read_buffer  = widx;
+    cdrom->current_write_buffer = (widx + 1) % CDROM_SECTOR_BUFFERS;
+
+    LOG_CDROM_DEBUG("[CDROM] Sector LBA=%u -> INT1", cdrom->current_lba);
+
+    /* INT1: data ready. The deadline of the next sector is set here, when
+     * this sector was delivered: the head reaches the next one a sector
+     * period later whatever the guest does with the interrupt. The event is
+     * armed for it too, so an ADPCM or filtered sector that follows is
+     * handled on time even before this INT1 is acknowledged; the acknowledge
+     * re-arms the same deadline. ZS1_CD_XA_HOLD=1 leaves the re-arm to the
+     * acknowledge alone, as before. */
+    {
+        uint32_t period = cdrom->double_speed ? CDROM_READ_DELAY_2X : CDROM_READ_DELAY_1X;
+        if (cdrom_xa_hold_legacy()) {
+            if (cdrom->inter)
+                cdrom->drive_deadline = cdrom->inter->cpu_cycle_counter + period;
+        } else {
+            cdrom_schedule_drive_event(cdrom, period);
+        }
+    }
+    fifo_clear(&cdrom->response_fifo);
+    cdrom_push_response(cdrom, cdrom_get_stat_byte(cdrom));
+    cdrom->interrupt_flag = CDROM_INT_DATA_READY;
+    if (cdrom->inter) interconnect_trigger_cdrom_irq(cdrom->inter);
+    lua_debug_notify("cdrom_int1");
+
+    cdrom->head_lba = cdrom->current_lba;   /* the sector just transferred */
+    cdrom->current_lba++;
+    if (cdrom->drive_state == DRIVE_READING)
+        cdrom_async_reader_queue(&cdrom->async_reader, cdrom->current_lba);
+}
+
+void cdrom_execute_drive_int_pending(Cdrom *cdrom) {
+    if (cdrom->drive_state == DRIVE_READING)
+        cdrom_drive_read_sector(cdrom, true);
+}
+
+void cdrom_execute_drive(Cdrom *cdrom) {
+    if (cdrom->drive_state == DRIVE_READING) {
+        cdrom_drive_read_sector(cdrom, false);
 
     } else if (cdrom->drive_state == DRIVE_PLAYING) {
         /* CDDA */
@@ -1013,11 +1138,16 @@ void cdrom_execute_drive(Cdrom *cdrom) {
             cdrom->seek_phase  = false;
             return;
         }
-        cdrom->seek_phase = false;   /* head arrived — same rule as the read path */
+        /* The first sector after the implicit seek of a Play (begin_playing)
+         * is where the head lands; AutoPause below only compares from the
+         * second one on. */
+        bool first_after_seek = cdrom->seek_phase;
+        cdrom->seek_phase = false;   /* head arrived, same rule as the read path */
 
         /* Check for lead-out (track AA) */
-        uint8_t track_num = cdrom_disc_get_track_at_lba(&cdrom->disc, cdrom->current_lba);
-        bool is_lead_out  = (cdrom->current_lba >= cdrom->disc.total_sectors);
+        uint32_t lba = cdrom->current_lba;
+        uint8_t track_num = cdrom_disc_get_track_at_lba(&cdrom->disc, lba);
+        bool is_lead_out  = (lba >= cdrom->disc.total_sectors);
         bool track_is_audio = (track_num >= cdrom->disc.first_track)
                                ? cdrom->disc.tracks[track_num].is_audio
                                : false;
@@ -1032,35 +1162,54 @@ void cdrom_execute_drive(Cdrom *cdrom) {
             return;
         }
 
+        /* This sector's subchannel Q, unless LibCrypt makes the controller
+         * discard it (same rule as the read path). */
+        bool q_valid = !cdrom_disc_sbi_covers(&cdrom->disc, lba);
+        SubQ q = q_valid ? cdrom_disc_get_subq(&cdrom->disc, lba) : cdrom->last_subq;
+
+        /* AutoPause: "Issue INT4(stat) and PAUSE at end of TRACK", where "End
+         * of Track is determined by sensing a track number transition in SubQ
+         * position info" (psx-spx cdr/cdromdrive.md:1097-1104): this sector's Q
+         * against the previous one's, the drive's own state. It used to be a
+         * function-static previous track, shared by every Play and kept across
+         * Pause, Setloc and savestates, so a new Play on another track paused
+         * at its first sector. The first sector after a Play's seek has no
+         * predecessor to compare with.
+         *
+         * "After autopause, the disc stays at the <end> of the old track, NOT
+         * at the <begin> of the next track (so trying to resume playing by
+         * sending a new Play command without new Seek/Setloc command will
+         * instantly pause again)" (:1104-1107): the position goes back to the
+         * last sector of the old track, and the new track's first sector is
+         * not played. */
+        if (cdrom->auto_pause && !first_after_seek && q_valid &&
+            q.track_bcd != cdrom->last_subq.track_bcd) {
+            fifo_clear(&cdrom->response_fifo);
+            cdrom_push_response(cdrom, cdrom_get_stat_byte(cdrom));
+            cdrom->interrupt_flag = CDROM_INT_DATA_END;
+            cdrom->drive_state    = DRIVE_IDLE;
+            cdrom->current_lba    = lba ? lba - 1 : 0;
+            cdrom->head_lba       = cdrom->current_lba;
+            LOG_CDROM_DEBUG("[CDROM] AutoPause: track %02X -> %02X at LBA %u",
+                            cdrom->last_subq.track_bcd, q.track_bcd, lba);
+            if (cdrom->inter) interconnect_trigger_cdrom_irq(cdrom->inter);
+            return;
+        }
+
         if (track_is_audio) {
             cdrom_audio_process_cdda(&cdrom->audio_fifo, raw);
         }
 
-        /* Auto-pause on track change */
-        if (cdrom->auto_pause) {
-            static uint8_t prev_track = 0;
-            uint8_t ct = cdrom_disc_get_track_at_lba(&cdrom->disc, cdrom->current_lba);
-            if (prev_track != 0 && ct != prev_track) {
-                /* INT4 */
-                fifo_clear(&cdrom->response_fifo);
-                cdrom_push_response(cdrom, cdrom_get_stat_byte(cdrom));
-                cdrom->interrupt_flag = CDROM_INT_DATA_END;
-                cdrom->drive_state    = DRIVE_IDLE;
-                prev_track = 0;
-                if (cdrom->inter) interconnect_trigger_cdrom_irq(cdrom->inter);
-                return;
-            }
-            prev_track = ct;
+        if (q_valid) {
+            cdrom->current_subq_lba = lba;
+            cdrom->last_subq = q;
         }
-
-        /* Update SubQ — same LibCrypt rule as the data path above. */
-        if (!cdrom_disc_sbi_covers(&cdrom->disc, cdrom->current_lba)) {
-            cdrom->current_subq_lba = cdrom->current_lba;
-            cdrom->last_subq = cdrom_disc_get_subq(&cdrom->disc, cdrom->current_lba);
-        }
+        /* The pickup is on this sector now. Seeks after a Play measured their
+         * distance from wherever the last data read had left head_lba. */
+        cdrom->head_lba = lba;
 
         /* Report: INT1(stat, track, index, mm/amm, ss+80h/ass, sect/asect,
-         * peaklo, peakhi) — eight bytes, and NOT on every sector. The packet
+         * peaklo, peakhi), eight bytes, and NOT on every sector. The packet
          * carries absolute time on asect 00/20/40/60h and time within the track
          * (with bit7 of ss set) on 10/30/50/70h (cdromdrive.md:1077-1094).
          *

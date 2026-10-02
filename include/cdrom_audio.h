@@ -51,7 +51,7 @@ bool cdrom_audio_fifo_empty(const AudioFifo *fifo);
 
 /* Decode one XA-ADPCM sector (18 chunks × 128 bytes starting at sector byte 24).
  * Muting is not a parameter: it belongs to the output stage, see
- * cdrom_get_audio_frame(). */
+ * cdrom_audio_apply_output(). */
 void cdrom_audio_decode_xa(XaAdpcmState *xa, AudioFifo *fifo,
                             const uint8_t *xa_data,
                             bool stereo, bool bits8, bool rate_18900);
@@ -61,5 +61,11 @@ void cdrom_audio_process_cdda(AudioFifo *fifo, const uint8_t *raw_sector);
 
 /* Pop one stereo frame for SPU/SDL output */
 void cdrom_audio_get_frame(AudioFifo *fifo, int16_t *left, int16_t *right);
+
+/* The CD controller's output stage on one stereo frame: muted forces both
+ * outputs to 0, otherwise the ATV0-ATV3 matrix (ll = ATV0 L->L, lr = ATV3 R->L,
+ * rl = ATV1 L->R, rr = ATV2 R->R; 80h = unity) with saturation. Pure. */
+void cdrom_audio_apply_output(int16_t *left, int16_t *right, bool muted,
+                              uint8_t ll, uint8_t lr, uint8_t rl, uint8_t rr);
 
 #endif /* CDROM_AUDIO_H */

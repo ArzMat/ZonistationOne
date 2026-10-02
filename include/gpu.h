@@ -174,11 +174,16 @@ typedef struct Gpu { // Define struct Gpu
     uint16_t vram_load_h;             // Height of the image being loaded
     uint32_t vram_load_count;         // Counter for pixels transferred during current load
 
-    // --- VRAM Dirty Tracking ---
-    bool vram_dirty;                  // True when CPU-side VRAM has been modified since last GPU upload
+    // --- VRAM Dirty Tracking (retired) ---
+    // Set by GP0(02h) to make the next textured primitive re-upload all of VRAM.
+    // A fill now reaches the renderer as an upload of its own rectangle, so
+    // nothing sets or reads it; the field stays so the saved Gpu span keeps
+    // its layout. Where the renderer may be ahead of the CPU copy is tracked
+    // by vram_raster_*() in vram.c instead.
+    bool vram_dirty;
 
     // --- GP1 Info Latch (for GP1(0x10) GetGPUInfo responses) ---
-    uint32_t gpu_info_latch;          // Data returned by GPUREAD after GP1(0x10) info request
+    uint32_t gpu_info_latch;          // GPUREAD latch: the last GP1(0x10) result or VRAM word, re-readable
 
     // --- Polyline State (GP0(0x48/0x58) polyline accumulation) ---
     uint32_t polyline_buffer[256];    // Vertex+color words accumulated for current polyline
@@ -208,6 +213,8 @@ uint32_t gpu_read_data(Gpu* gpu);         // Reads data from GPUREAD port (e.g.,
 void gpu_init_full(Gpu* gpu, Interconnect* inter);
 // GPU soft reset (does NOT clear VRAM)
 void gpu_soft_reset(Gpu* gpu);
+/* Push the pixels an interrupted GP0(A0h) upload already wrote (gpu_commands.c). */
+void gpu_flush_partial_upload(Gpu* gpu);
 /* Re-send every piece of persistent drawing state to the renderer.
  * The ten renderer_set_* values live in the backend, not in Gpu, so a backend
  * that has just been created starts from its own defaults and would draw the

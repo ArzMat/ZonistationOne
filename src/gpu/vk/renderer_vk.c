@@ -26,7 +26,9 @@
  */
 
 #include "renderer_vk.h"
+#include "../renderer_isolate.h"
 #include "log.h"
+#include "frame_events.h"
 #include "vk_imgui.h"
 
 #include <string.h>
@@ -82,11 +84,24 @@ static uint32_t  s_vtx_used[2];
 static uint8_t   s_vram_pool[2][VKR_VRAM_POOL_SIZE];
 static uint32_t  s_vram_pool_used[2];
 static uint32_t  s_pool_peak, s_pool_updates, s_pool_skips;
+/* First op of each slot not yet replayed. A synchronous readback replays the
+ * write slot part of the way so the pixels it reads include this field's
+ * primitives; the frame replay then carries on from here instead of running
+ * those ops twice (a semi-transparent draw would blend twice). Render thread
+ * writes it, only while the CPU thread is blocked in vkr_read_vram_rect() or
+ * after the slot has been submitted. Same scheme as the GL backend. */
+static uint32_t  s_exec_from[2];
 
-/* Whole-VRAM readback, matching the GL backend's async channel. */
-static uint16_t     s_readback_vram[VKR_VRAM_W * VKR_VRAM_H];
+/* Whole-VRAM readback, matching the GL backend's async channel: two buffers
+ * published by index, for the same reason as there. The render thread fills
+ * the one readers are not holding, then flips s_readback_pub and bumps the
+ * sequence; a Lua probe reading the result from inside the emulation, which
+ * now overlaps the render thread's previous frame, never sees a half-written
+ * buffer. The sequence is atomic for the same reason. */
+static uint16_t      s_readback_vram[2][VKR_VRAM_W * VKR_VRAM_H];
+static SDL_AtomicInt s_readback_pub;
 static SDL_AtomicInt s_readback_request;
-static uint32_t     s_readback_seq;
+static SDL_AtomicInt s_readback_seq;
 
 /* ------------------------------------------------------------------------- */
 /* Small resource helpers                                                     */
@@ -545,6 +560,22 @@ static bool vkr_create_frame_objects(VkRenderer* r) {
         if (!vkr_buffer_create(r, &r->staging_buf[i], VKR_VRAM_POOL_SIZE,
                                VK_BUFFER_USAGE_TRANSFER_SRC_BIT)) return false;
     }
+    /* The readback objects, see VkRenderer. The fence starts unsignalled: it is
+     * only ever waited on right after the submit that signals it. */
+    {
+        VkCommandBufferAllocateInfo rbi = {
+            .sType              = VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO,
+            .commandPool        = r->cmd_pool,
+            .level              = VK_COMMAND_BUFFER_LEVEL_PRIMARY,
+            .commandBufferCount = 1,
+        };
+        VK_TRY(vkAllocateCommandBuffers(r->ctx.device, &rbi, &r->rb_cmd), "vkAllocateCommandBuffers(readback)");
+        VkFenceCreateInfo fci = { .sType = VK_STRUCTURE_TYPE_FENCE_CREATE_INFO };
+        VK_TRY(vkCreateFence(r->ctx.device, &fci, NULL, &r->rb_fence), "vkCreateFence(readback)");
+        if (!vkr_buffer_create(r, &r->readback_buf, (VkDeviceSize)VKR_VRAM_W * VKR_VRAM_H * 4,
+                               VK_BUFFER_USAGE_TRANSFER_DST_BIT)) return false;
+    }
+
     /* One release semaphore per swapchain image, not per frame slot: a
      * semaphore signalled by a present cannot be reused until that present has
      * been consumed, and the number of images in flight is the swapchain's
@@ -674,6 +705,9 @@ void vkr_destroy(VkRenderer* r) {
     }
     for (uint32_t i = 0; i < VK_MAX_SWAP_IMAGES; i++)
         if (r->release_sem[i]) vkDestroySemaphore(r->ctx.device, r->release_sem[i], NULL);
+    if (r->rb_fence) { vkDestroyFence(r->ctx.device, r->rb_fence, NULL); r->rb_fence = VK_NULL_HANDLE; }
+    vkr_buffer_destroy(r, &r->readback_buf);
+    r->rb_cmd = VK_NULL_HANDLE;   /* freed with the pool below */
     if (r->cmd_pool) vkDestroyCommandPool(r->ctx.device, r->cmd_pool, NULL);
 
     if (r->sampler) vkDestroySampler(r->ctx.device, r->sampler, NULL);
@@ -708,6 +742,11 @@ static void vkr_record_batch(VkRenderer* r, bool is_line) {
         r->vertex_count = 0;
         return;
     }
+
+    /* The Pipeline view's "Draw batches" counter, fed exactly where the GL
+     * backend feeds it (glr_draw): one event per recorded batch. It was GL-only,
+     * which hid how many batches this backend made. */
+    frame_events_record(FEV_DRAW_BATCH, r->vertex_count);
 
     memcpy(&s_vtx_pool[wi][s_vtx_used[wi]], r->cpu_vertices,
            (size_t)r->vertex_count * sizeof(VkrVertex));
@@ -760,9 +799,20 @@ static void vkr_stage_vertex(VkRenderer* r, const RendererPosition* p, const Ren
     v->clut = clut; v->tpage = tpage;
 }
 
+/* As glr_isolate_if_needed: a primitive that may read what its own draw call
+ * writes is closed into a batch of its own (renderer_isolate.h). */
+static void vkr_isolate_if_needed(VkRenderer* r, bool textured, uint16_t tpage, uint16_t clut) {
+    const int16_t* a = r->draw_area;
+    const bool own = zs1_prim_reads_drawn_area(r->mask_test_enabled, textured && r->texture_enabled,
+                                               tpage, clut, a[0], a[1], a[2], a[3]);
+    if (own || r->last_prim_isolated) VKR_FLUSH(r);
+    r->last_prim_isolated = own;
+}
+
 void vkr_push_triangle(VkRenderer* r, RendererPosition p[3], RendererColor c[3],
                        RendererTexCoord t[3], uint16_t clut, uint16_t tpage) {
     if (!r->initialized) return;
+    vkr_isolate_if_needed(r, t != NULL, tpage, clut);
     if (r->pending_is_line) VKR_FLUSH(r);
     r->pending_is_line = false;
     if (r->vertex_count + 3 > VERTEX_BUFFER_LEN) vkr_record_batch(r, false);
@@ -772,6 +822,7 @@ void vkr_push_triangle(VkRenderer* r, RendererPosition p[3], RendererColor c[3],
 void vkr_push_quad(VkRenderer* r, RendererPosition p[4], RendererColor c[4],
                    RendererTexCoord t[4], uint16_t clut, uint16_t tpage) {
     if (!r->initialized) return;
+    vkr_isolate_if_needed(r, t != NULL, tpage, clut);
     if (r->pending_is_line) VKR_FLUSH(r);
     r->pending_is_line = false;
     if (r->vertex_count + 6 > VERTEX_BUFFER_LEN) vkr_record_batch(r, false);
@@ -787,61 +838,101 @@ void vkr_push_quad(VkRenderer* r, RendererPosition p[4], RendererColor c[4],
 
 void vkr_push_line(VkRenderer* r, RendererPosition p[2], RendererColor c[2]) {
     if (!r->initialized) return;
+    vkr_isolate_if_needed(r, false, 0, 0);
     if (!r->pending_is_line) VKR_FLUSH(r);
     r->pending_is_line = true;
     if (r->vertex_count + 2 > VERTEX_BUFFER_LEN) vkr_record_batch(r, true);
     for (int i = 0; i < 2; i++) vkr_stage_vertex(r, &p[i], &c[i], NULL, 0, 0);
 }
 
-void vkr_set_texture_mode(VkRenderer* r, bool e)     { VKR_FLUSH(r); r->texture_enabled = e; }
-void vkr_set_raw_texture_mode(VkRenderer* r, bool e) { VKR_FLUSH(r); r->raw_texture_enabled = e; }
-void vkr_set_dither_mode(VkRenderer* r, bool e)      { VKR_FLUSH(r); r->dither_enabled = e; }
-void vkr_set_mask_mode(VkRenderer* r, bool e)        { VKR_FLUSH(r); r->set_mask_enabled = e; }
-void vkr_set_mask_test(VkRenderer* r, bool e)        { VKR_FLUSH(r); r->mask_test_enabled = e; }
+/* Every setter compares before it flushes, as the GL backend's do.
+ *
+ * They used to flush unconditionally, and gpu_commands.c calls three or four
+ * of them in front of every primitive, so the first setter of primitive N
+ * closed the batch of primitive N-1 even when nothing had changed: every
+ * primitive became its own batch, its own rendering scope and its own
+ * pipeline barrier, and a 3D field ran into VKR_MAX_BATCHES. The comparisons
+ * cover every field vkr_record_batch() copies into the batch snapshot
+ * (textured, raw_texture, semi_trans + mode, dither, set_mask, mask_test,
+ * screen size, offset, texture window, scissor); the topology is handled by
+ * the push functions through pending_is_line. A value that does not change
+ * cannot make two batches differ, so merging them changes no pixel. */
+void vkr_set_texture_mode(VkRenderer* r, bool e) {
+    if (r->texture_enabled == e) return;
+    VKR_FLUSH(r); r->texture_enabled = e;
+}
+void vkr_set_raw_texture_mode(VkRenderer* r, bool e) {
+    if (r->raw_texture_enabled == e) return;
+    VKR_FLUSH(r); r->raw_texture_enabled = e;
+}
+void vkr_set_dither_mode(VkRenderer* r, bool e) {
+    if (r->dither_enabled == e) return;
+    VKR_FLUSH(r); r->dither_enabled = e;
+}
+void vkr_set_mask_mode(VkRenderer* r, bool e) {
+    if (r->set_mask_enabled == e) return;
+    VKR_FLUSH(r); r->set_mask_enabled = e;
+}
+void vkr_set_mask_test(VkRenderer* r, bool e) {
+    if (r->mask_test_enabled == e) return;
+    VKR_FLUSH(r); r->mask_test_enabled = e;
+}
 
 void vkr_set_semi_trans_mode(VkRenderer* r, bool e, uint8_t mode) {
+    if (r->semi_trans_enabled == e && r->semi_trans_mode == mode) return;
     VKR_FLUSH(r);
     r->semi_trans_enabled = e;
     r->semi_trans_mode    = mode;
 }
 
 void vkr_set_screen_scale(VkRenderer* r, uint16_t w, uint16_t h) {
-    VKR_FLUSH(r);
-    /* Full extent here, halved when it becomes a push constant — the GL backend
+    /* Full extent here, halved when it becomes a push constant; the GL backend
      * stores it the same way and halves it at glUniform2f time. Keeping the
      * field meaning identical in both is what makes them diffable. */
-    r->screen_width  = (w > 0) ? (float)w : (float)VKR_VRAM_W;
-    r->screen_height = (h > 0) ? (float)h : (float)VKR_VRAM_H;
+    const float sw = (w > 0) ? (float)w : (float)VKR_VRAM_W;
+    const float sh = (h > 0) ? (float)h : (float)VKR_VRAM_H;
+    if (r->screen_width == sw && r->screen_height == sh) return;
+    VKR_FLUSH(r);
+    r->screen_width  = sw;
+    r->screen_height = sh;
 }
 
 void vkr_set_texture_window(VkRenderer* r, uint8_t mx, uint8_t my, uint8_t ox, uint8_t oy) {
-    VKR_FLUSH(r);
     /* GP0(E2) gives masks in 8-pixel units. The shader wants the AND/OR pair
-     * ready to use, so the arithmetic happens once here, as it does in GL. */
-    r->cached_tex_window[0] = (int32_t)(~(mx * 8) & 0xFF);
-    r->cached_tex_window[1] = (int32_t)(~(my * 8) & 0xFF);
-    r->cached_tex_window[2] = (int32_t)((ox * 8) & 0xFF);
-    r->cached_tex_window[3] = (int32_t)((oy * 8) & 0xFF);
+     * ready to use, so the arithmetic happens once here, as it does in GL:
+     * "Texcoord = (Texcoord AND (NOT (Mask * 8))) OR ((Offset AND Mask) * 8)"
+     * (psx-spx gpu/rendering-attributes.md:110). The offset used to go in
+     * without the AND, so offset bits outside the mask were ORed into every
+     * coordinate on Vulkan and not on GL. */
+    const int32_t tw[4] = {
+        (int32_t)(~(mx * 8) & 0xFF), (int32_t)(~(my * 8) & 0xFF),
+        (int32_t)(((ox & mx) * 8) & 0xFF), (int32_t)(((oy & my) * 8) & 0xFF),
+    };
+    if (memcmp(r->cached_tex_window, tw, sizeof(tw)) == 0) return;
+    VKR_FLUSH(r);
+    memcpy(r->cached_tex_window, tw, sizeof(tw));
 }
 
 void vkr_set_draw_offset(VkRenderer* r, int16_t x, int16_t y) {
+    if (r->cached_offset_x == x && r->cached_offset_y == y) return;
     VKR_FLUSH(r);
     r->cached_offset_x = x;
     r->cached_offset_y = y;
 }
 
 void vkr_set_drawing_area(VkRenderer* r, uint16_t l, uint16_t t, uint16_t rt, uint16_t b) {
-    VKR_FLUSH(r);
+    r->draw_area[0] = (int16_t)l;  r->draw_area[1] = (int16_t)t;
+    r->draw_area[2] = (int16_t)rt; r->draw_area[3] = (int16_t)b;
     /* No Y flip, for the same reason the vertex shader has none: VRAM row N is
      * image row N in both APIs. GL does not flip here either. */
     int w = (int)rt - (int)l + 1;
     int h = (int)b  - (int)t + 1;
     if (w < 0) w = 0;
     if (h < 0) h = 0;
-    r->cached_scissor[0] = l;
-    r->cached_scissor[1] = t;
-    r->cached_scissor[2] = w;
-    r->cached_scissor[3] = h;
+    const int32_t sc[4] = { l, t, w, h };
+    if (memcmp(r->cached_scissor, sc, sizeof(sc)) == 0) return;
+    VKR_FLUSH(r);
+    memcpy(r->cached_scissor, sc, sizeof(sc));
 }
 
 void vkr_set_display_region(VkRenderer* r, uint16_t x, uint16_t y, uint16_t w, uint16_t h) {
@@ -859,9 +950,10 @@ void vkr_update_vram_viewer(VkRenderer* r, const uint8_t* bytes) { (void)r; (voi
 
 void vkr_get_pool_stats(VkRenderer* r, uint32_t* used, uint32_t* peak,
                         uint32_t* updates, uint32_t* skips) {
-    (void)r;
-    if (used)    *used    = s_vram_pool_used[0] > s_vram_pool_used[1]
-                            ? s_vram_pool_used[0] : s_vram_pool_used[1];
+    /* The write slot only, as the GL backend reports it. The other slot belongs
+     * to the render thread, which may be resetting it right now: emulation (and
+     * the Lua probe that asks for this) overlaps the previous frame's replay. */
+    if (used)    *used    = s_vram_pool_used[r->write_idx];
     if (peak)    *peak    = s_pool_peak;
     if (updates) *updates = s_pool_updates;
     if (skips)   *skips   = s_pool_skips;
@@ -967,8 +1059,8 @@ void vkr_request_vram_readback(VkRenderer* r) {
 }
 
 const uint16_t* vkr_get_vram_readback(uint32_t* seq_out) {
-    if (seq_out) *seq_out = s_readback_seq;
-    return s_readback_vram;
+    if (seq_out) *seq_out = (uint32_t)SDL_GetAtomicInt(&s_readback_seq);
+    return s_readback_vram[SDL_GetAtomicInt(&s_readback_pub)];
 }
 
 /* ------------------------------------------------------------------------- */
@@ -982,13 +1074,19 @@ const uint16_t* vkr_get_vram_readback(uint32_t* seq_out) {
  * GL backend's sync readback, for the same reason. */
 static SDL_AtomicInt  s_sync_rb_pending;
 static SDL_Condition* s_sync_rb_done;
-static uint16_t*      s_sync_rb_dest;
+static uint16_t*      s_sync_rb_dest;      /* the whole CPU-side VRAM, written in place */
 static uint16_t       s_sync_rb_x, s_sync_rb_y, s_sync_rb_w, s_sync_rb_h;
+static int            s_sync_rb_slot;      /* the write slot whose pending ops must land first */
 static bool           s_sync_rb_ok;
 
-/* A device-local readback staging buffer, host-visible, big enough for the
- * whole VRAM. One allocation for the process rather than one per call. */
-static VkrBuffer s_readback_buf;
+/* How much of the write slot's vertex and staging pools a synchronous readback
+ * has already copied into the next frame's GPU buffers (vertex_buf/staging_buf
+ * [frame_slot]), so a second readback in the same field copies only what was
+ * recorded since. Valid for s_rb_staged_slot only, and forgotten whenever a
+ * frame goes through (that frame rewrites those buffers). Render thread. */
+static int            s_rb_staged_slot = -1;
+static uint32_t       s_rb_staged_vtx, s_rb_staged_pool;
+
 
 static void vkr_fill_ps1_push(const VkrBatch* b, int stp_mode, VkrPs1Push* out) {
     out->offset[0] = b->offset_x;
@@ -1101,6 +1199,33 @@ static void vkr_exec_vram_update(VkRenderer* r, VkCommandBuffer cmd, const VkrVr
      * ordering the op list exists to preserve. */
     vkr_end_vram_rendering(cmd, rendering);
 
+    /* And wait for what the batches before it did to the same image: their
+     * colour writes (write-after-write) and their texture reads
+     * (write-after-read), and an earlier copy to an overlapping rect. Without
+     * this the transfer could land first and be drawn over, the Dino Crisis
+     * symptom in a new place; the old replay had a barrier between batches but
+     * none between the last batch and a copy. */
+    {
+        VkImageMemoryBarrier pre = {
+            .sType               = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER,
+            .srcAccessMask       = VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT |
+                                   VK_ACCESS_TRANSFER_WRITE_BIT,
+            .dstAccessMask       = VK_ACCESS_TRANSFER_WRITE_BIT,
+            .oldLayout           = VK_IMAGE_LAYOUT_GENERAL,
+            .newLayout           = VK_IMAGE_LAYOUT_GENERAL,
+            .srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED,
+            .dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED,
+            .image               = r->vram.image,
+            .subresourceRange    = { VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1 },
+        };
+        vkCmdPipelineBarrier(cmd,
+                             VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT |
+                             VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT |
+                             VK_PIPELINE_STAGE_TRANSFER_BIT,
+                             VK_PIPELINE_STAGE_TRANSFER_BIT,
+                             0, 0, NULL, 0, NULL, 1, &pre);
+    }
+
     VkBufferImageCopy c = {
         .bufferOffset      = u->data_offset,
         .bufferRowLength   = u->w,
@@ -1175,61 +1300,206 @@ static void vkr_fullscreen_pass(VkRenderer* r, VkCommandBuffer cmd, VkrImage* ta
                       VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT);
 }
 
-/* Copy a VRAM rect out of the image into host memory as PS1 halfwords.
- * Runs on the render thread with the queue idle, so it can submit its own
- * one-shot command buffer. */
-static bool vkr_do_readback(VkRenderer* r, uint16_t x, uint16_t y, uint16_t w, uint16_t h,
-                            uint16_t* dest) {
-    if (!w || !h || !dest) return false;
-    if (!s_readback_buf.buffer &&
-        !vkr_buffer_create(r, &s_readback_buf,
-                           (VkDeviceSize)VKR_VRAM_W * VKR_VRAM_H * 4,
-                           VK_BUFFER_USAGE_TRANSFER_DST_BIT))
-        return false;
+/* Replay state for one pass over a slot's ops (a frame, or the part of the
+ * write slot a synchronous readback runs).
+ *
+ * The old replay ended rendering, issued the feedback barrier and began
+ * rendering again between every two batches, whatever they did. Only a batch
+ * that *reads* VRAM needs that barrier: a textured one, or one with the mask
+ * test on (it reads the destination). A batch that only writes, or blends,
+ * is ordered by the pipeline within one rendering scope, so consecutive
+ * non-reading batches now share a scope, and a reading batch gets the barrier
+ * only if something was written since the last one. VRAM update ops count as
+ * writes. A replay starts as "written", conservatively. */
+typedef struct {
+    bool rendering;    /* inside vkCmdBeginRendering on the VRAM image */
+    bool written;      /* colour writes may not be visible to texel fetches yet */
+} VkrReplay;
 
-    VkCommandBufferAllocateInfo cbi = {
-        .sType              = VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO,
-        .commandPool        = r->cmd_pool,
-        .level              = VK_COMMAND_BUFFER_LEVEL_PRIMARY,
-        .commandBufferCount = 1,
-    };
-    VkCommandBuffer cmd;
-    if (vkAllocateCommandBuffers(r->ctx.device, &cbi, &cmd) != VK_SUCCESS) return false;
+static void vkr_replay_slot(VkRenderer* r, VkCommandBuffer cmd, int ri, uint32_t buf_slot,
+                            VkrReplay* st) {
+    VkrFrame* f = &s_frame[ri];
+    for (uint32_t i = s_exec_from[ri]; i < f->op_count; i++) {
+        if (f->ops[i].type == VKR_OP_VRAM_UPDATE) {
+            vkr_exec_vram_update(r, cmd, &f->vram_updates[f->ops[i].index], buf_slot, &st->rendering);
+            st->written = true;
+        } else {
+            const VkrBatch* b = &f->batches[f->ops[i].index];
+            if ((b->textured || b->mask_test) && st->written) {
+                /* The glTextureBarrier() equivalent: make earlier writes visible
+                 * to this batch's sampler. A barrier cannot sit inside a
+                 * dynamic rendering scope, so the scope closes first. */
+                vkr_end_vram_rendering(cmd, &st->rendering);
+                vkr_barrier_vram_feedback(cmd, &r->vram);
+                st->written = false;
+            }
+            vkr_exec_batch(r, cmd, b, buf_slot, &st->rendering);
+            if (b->vertex_count) st->written = true;
+        }
+    }
+    s_exec_from[ri] = f->op_count;
+}
 
+/* Readback plumbing: the one command buffer and fence in VkRenderer.
+ *
+ * The command buffer opens with a global barrier against everything submitted
+ * before it, so whatever earlier frames or replays wrote to the VRAM image is
+ * complete and visible before this one reads or writes it. That is what the
+ * vkQueueWaitIdle in front of the old readback was for, expressed as a
+ * dependency instead of a full drain, and it also covers the previous frame's
+ * scanout and ImGui reads of images this may touch. */
+static void vkr_rb_begin(VkRenderer* r) {
+    VkCommandBuffer cmd = r->rb_cmd;
+    vkResetCommandBuffer(cmd, 0);
     VkCommandBufferBeginInfo bi = { .sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO,
                                     .flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT };
     vkBeginCommandBuffer(cmd, &bi);
-    VkBufferImageCopy c = {
-        .bufferOffset      = 0,
-        .bufferRowLength   = w,
-        .bufferImageHeight = h,
-        .imageSubresource  = { VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1 },
-        .imageOffset       = { x, y, 0 },
-        .imageExtent       = { w, h, 1 },
+    VkMemoryBarrier mb = {
+        .sType         = VK_STRUCTURE_TYPE_MEMORY_BARRIER,
+        .srcAccessMask = VK_ACCESS_MEMORY_WRITE_BIT,
+        .dstAccessMask = VK_ACCESS_MEMORY_READ_BIT | VK_ACCESS_MEMORY_WRITE_BIT,
     };
-    vkCmdCopyImageToBuffer(cmd, r->vram.image, VK_IMAGE_LAYOUT_GENERAL,
-                           s_readback_buf.buffer, 1, &c);
-    vkEndCommandBuffer(cmd);
+    vkCmdPipelineBarrier(cmd, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT,
+                         0, 1, &mb, 0, NULL, 0, NULL);
+}
 
+static bool vkr_rb_submit_wait(VkRenderer* r) {
+    VkCommandBuffer cmd = r->rb_cmd;
+    vkEndCommandBuffer(cmd);
     VkSubmitInfo si = { .sType = VK_STRUCTURE_TYPE_SUBMIT_INFO,
                         .commandBufferCount = 1, .pCommandBuffers = &cmd };
-    vkQueueSubmit(r->ctx.queue, 1, &si, VK_NULL_HANDLE);
-    vkQueueWaitIdle(r->ctx.queue);
-    vkFreeCommandBuffers(r->ctx.device, r->cmd_pool, 1, &cmd);
+    if (vkQueueSubmit(r->ctx.queue, 1, &si, r->rb_fence) != VK_SUCCESS) return false;
+    VkResult w = vkWaitForFences(r->ctx.device, 1, &r->rb_fence, VK_TRUE, UINT64_MAX);
+    vkResetFences(r->ctx.device, 1, &r->rb_fence);
+    return w == VK_SUCCESS;
+}
 
-    /* Back down to 5:5:5:1. The +4 rounding the expansion used is undone by the
-     * >>3, so this is the exact inverse and a round-trip changes nothing. */
-    const uint8_t* src = (const uint8_t*)s_readback_buf.mapped;
+/* Record the copy of a VRAM rect (or, when the rect wraps past the right or
+ * bottom edge, the whole image, as the GL backend does) into readback_buf, with
+ * the barriers on both sides: rendered and uploaded pixels before the transfer
+ * read, and the transfer write before the host reads the mapped buffer. */
+static void vkr_rb_record_copy(VkRenderer* r, uint16_t x, uint16_t y, uint16_t w, uint16_t h,
+                               bool whole) {
+    VkCommandBuffer cmd = r->rb_cmd;
+    VkImageMemoryBarrier ib = {
+        .sType               = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER,
+        .srcAccessMask       = VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT | VK_ACCESS_TRANSFER_WRITE_BIT,
+        .dstAccessMask       = VK_ACCESS_TRANSFER_READ_BIT,
+        .oldLayout           = VK_IMAGE_LAYOUT_GENERAL,
+        .newLayout           = VK_IMAGE_LAYOUT_GENERAL,
+        .srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED,
+        .dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED,
+        .image               = r->vram.image,
+        .subresourceRange    = { VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1 },
+    };
+    vkCmdPipelineBarrier(cmd,
+                         VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT | VK_PIPELINE_STAGE_TRANSFER_BIT,
+                         VK_PIPELINE_STAGE_TRANSFER_BIT, 0, 0, NULL, 0, NULL, 1, &ib);
+    VkBufferImageCopy c = {
+        .bufferOffset      = 0,
+        .bufferRowLength   = whole ? VKR_VRAM_W : w,
+        .bufferImageHeight = whole ? VKR_VRAM_H : h,
+        .imageSubresource  = { VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1 },
+        .imageOffset       = { whole ? 0 : x, whole ? 0 : y, 0 },
+        .imageExtent       = { whole ? VKR_VRAM_W : w, whole ? VKR_VRAM_H : h, 1 },
+    };
+    vkCmdCopyImageToBuffer(cmd, r->vram.image, VK_IMAGE_LAYOUT_GENERAL,
+                           r->readback_buf.buffer, 1, &c);
+    VkBufferMemoryBarrier bb = {
+        .sType               = VK_STRUCTURE_TYPE_BUFFER_MEMORY_BARRIER,
+        .srcAccessMask       = VK_ACCESS_TRANSFER_WRITE_BIT,
+        .dstAccessMask       = VK_ACCESS_HOST_READ_BIT,
+        .srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED,
+        .dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED,
+        .buffer              = r->readback_buf.buffer,
+        .offset              = 0,
+        .size                = VK_WHOLE_SIZE,
+    };
+    vkCmdPipelineBarrier(cmd, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_HOST_BIT,
+                         0, 0, NULL, 1, &bb, 0, NULL);
+}
+
+/* Back down to 5:5:5:1 into the CPU-side VRAM, in place: row (y+row) & 511,
+ * column (x+col) & 1023, stride 1024, exactly where the caller's rect lives.
+ *
+ * The old version wrote the rect packed (row stride w) from the start of the
+ * array it was given, and both callers (gpu_commands.c GP0(80h) and GP0(C0h))
+ * pass the whole of gpu->vram.data: on Vulkan every such readback scribbled a
+ * w-wide copy of the rect over the top-left of VRAM and left the rect itself
+ * stale. The GL backend has always written in place. The +4 rounding the
+ * expansion used is undone by the >>3, so the round-trip is exact. */
+static void vkr_rb_unpack(const VkRenderer* r, uint16_t x, uint16_t y, uint16_t w, uint16_t h,
+                          bool whole, uint16_t* vram) {
+    const uint8_t* src = (const uint8_t*)r->readback_buf.mapped;
     for (uint32_t row = 0; row < h; row++) {
-        const uint8_t* s = src + (size_t)row * w * 4;
-        uint16_t*      d = dest + (size_t)row * w;
+        const uint32_t vy = ((uint32_t)y + row) & (VKR_VRAM_H - 1);
         for (uint32_t col = 0; col < w; col++) {
-            uint32_t r8 = s[col * 4 + 0], g8 = s[col * 4 + 1];
-            uint32_t b8 = s[col * 4 + 2], a8 = s[col * 4 + 3];
-            d[col] = (uint16_t)((r8 >> 3) | ((g8 >> 3) << 5) | ((b8 >> 3) << 10) |
-                                ((a8 >= 128) ? 0x8000 : 0));
+            const uint32_t vx = ((uint32_t)x + col) & (VKR_VRAM_W - 1);
+            const uint8_t* p = whole ? &src[((size_t)vy * VKR_VRAM_W + vx) * 4]
+                                     : &src[((size_t)row * w + col) * 4];
+            vram[(size_t)vy * VKR_VRAM_W + vx] =
+                (uint16_t)((p[0] >> 3) | ((p[1] >> 3) << 5) | ((p[2] >> 3) << 10) |
+                           ((p[3] >= 128) ? 0x8000 : 0));
         }
     }
+}
+
+/* The synchronous readback GP0(80h) and GP0(C0h) need: the CPU thread is
+ * blocked in vkr_read_vram_rect() and no frame is pending.
+ *
+ * The rect has to include what the current field has drawn so far, and those
+ * primitives are still unexecuted ops in the write slot. The old version copied
+ * the image without them, so a game that draws and then copies or reads back
+ * in the same field got the pixels from before the draw (the GL backend has
+ * always replayed them; see glr_service_sync_readback). Here the slot's
+ * outstanding ops are replayed into the image first, into the GPU buffers the
+ * next frame will use: vertex_buf/staging_buf[frame_slot], free once that
+ * slot's fence has signalled, and rewritten in full by that frame anyway. The
+ * frame replay then continues from s_exec_from, so nothing runs twice. */
+static bool vkr_service_sync_readback(VkRenderer* r, int wi, uint16_t x, uint16_t y,
+                                      uint16_t w, uint16_t h, uint16_t* vram) {
+    if (!w || !h || !vram || !r->rb_cmd || !r->readback_buf.mapped) return false;
+    const uint32_t slot = r->frame_slot;
+    const bool pending = s_exec_from[wi] < s_frame[wi].op_count;
+
+    if (pending) {
+        vkWaitForFences(r->ctx.device, 1, &r->fence[slot], VK_TRUE, UINT64_MAX);
+        if (s_rb_staged_slot != wi) {
+            s_rb_staged_slot = wi;
+            s_rb_staged_vtx = s_rb_staged_pool = 0;
+        }
+        if (s_vram_pool_used[wi] > s_rb_staged_pool)
+            memcpy((uint8_t*)r->staging_buf[slot].mapped + s_rb_staged_pool,
+                   s_vram_pool[wi] + s_rb_staged_pool, s_vram_pool_used[wi] - s_rb_staged_pool);
+        if (s_vtx_used[wi] > s_rb_staged_vtx)
+            memcpy((VkrVertex*)r->vertex_buf[slot].mapped + s_rb_staged_vtx,
+                   &s_vtx_pool[wi][s_rb_staged_vtx],
+                   (size_t)(s_vtx_used[wi] - s_rb_staged_vtx) * sizeof(VkrVertex));
+        s_rb_staged_pool = s_vram_pool_used[wi];
+        s_rb_staged_vtx  = s_vtx_used[wi];
+    }
+
+    vkr_rb_begin(r);
+    if (pending) {
+        VkrReplay st = { false, true };
+        vkr_replay_slot(r, r->rb_cmd, wi, slot, &st);
+        vkr_end_vram_rendering(r->rb_cmd, &st.rendering);
+    }
+    const bool whole = (uint32_t)x + w > VKR_VRAM_W || (uint32_t)y + h > VKR_VRAM_H;
+    vkr_rb_record_copy(r, x, y, w, h, whole);
+    if (!vkr_rb_submit_wait(r)) return false;
+    vkr_rb_unpack(r, x, y, w, h, whole, vram);
+    return true;
+}
+
+/* The whole image, for the asynchronous inspector/Lua channel: no replay, the
+ * frame that requested it has just been submitted in full. */
+static bool vkr_readback_whole(VkRenderer* r, uint16_t* vram) {
+    if (!r->rb_cmd || !r->readback_buf.mapped) return false;
+    vkr_rb_begin(r);
+    vkr_rb_record_copy(r, 0, 0, VKR_VRAM_W, VKR_VRAM_H, false);
+    if (!vkr_rb_submit_wait(r)) return false;
+    vkr_rb_unpack(r, 0, 0, VKR_VRAM_W, VKR_VRAM_H, false, vram);
     return true;
 }
 
@@ -1241,23 +1511,9 @@ static bool vkr_do_readback(VkRenderer* r, uint16_t x, uint16_t y, uint16_t w, u
  * That comparison is the whole parity check between the two renderers and there
  * is no other way to run it without a person looking at a screen. */
 static void vkr_dump_scanout(VkRenderer* r, const char* path) {
-    if (!s_readback_buf.buffer &&
-        !vkr_buffer_create(r, &s_readback_buf,
-                           (VkDeviceSize)VKR_VRAM_W * VKR_VRAM_H * 4,
-                           VK_BUFFER_USAGE_TRANSFER_DST_BIT))
-        return;
-
-    VkCommandBufferAllocateInfo cbi = {
-        .sType              = VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO,
-        .commandPool        = r->cmd_pool,
-        .level              = VK_COMMAND_BUFFER_LEVEL_PRIMARY,
-        .commandBufferCount = 1,
-    };
-    VkCommandBuffer cmd;
-    if (vkAllocateCommandBuffers(r->ctx.device, &cbi, &cmd) != VK_SUCCESS) return;
-    VkCommandBufferBeginInfo bi = { .sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO,
-                                    .flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT };
-    vkBeginCommandBuffer(cmd, &bi);
+    if (!r->rb_cmd || !r->readback_buf.mapped) return;
+    vkr_rb_begin(r);
+    VkCommandBuffer cmd = r->rb_cmd;
     /* The scanout image rests in SHADER_READ_ONLY_OPTIMAL between frames; a
      * transfer read needs it in TRANSFER_SRC and put back afterwards, or the
      * next frame's ImGui sampler sees the wrong layout. */
@@ -1271,18 +1527,13 @@ static void vkr_dump_scanout(VkRenderer* r, const char* path) {
         .imageExtent       = { VKR_VRAM_W, VKR_VRAM_H, 1 },
     };
     vkCmdCopyImageToBuffer(cmd, r->scanout.image, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
-                           s_readback_buf.buffer, 1, &c);
+                           r->readback_buf.buffer, 1, &c);
     vkr_image_barrier(cmd, &r->scanout, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL,
                       VK_ACCESS_TRANSFER_READ_BIT, VK_ACCESS_SHADER_READ_BIT,
                       VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT);
-    vkEndCommandBuffer(cmd);
-    VkSubmitInfo si = { .sType = VK_STRUCTURE_TYPE_SUBMIT_INFO,
-                        .commandBufferCount = 1, .pCommandBuffers = &cmd };
-    vkQueueSubmit(r->ctx.queue, 1, &si, VK_NULL_HANDLE);
-    vkQueueWaitIdle(r->ctx.queue);
-    vkFreeCommandBuffers(r->ctx.device, r->cmd_pool, 1, &cmd);
+    if (!vkr_rb_submit_wait(r)) return;
 
-    const uint8_t* src = (const uint8_t*)s_readback_buf.mapped;
+    const uint8_t* src = (const uint8_t*)r->readback_buf.mapped;
     uint8_t* rgb = (uint8_t*)malloc((size_t)VKR_VRAM_W * VKR_VRAM_H * 3);
     if (!rgb) return;
     for (size_t i = 0; i < (size_t)VKR_VRAM_W * VKR_VRAM_H; i++) {
@@ -1308,8 +1559,8 @@ static int vkr_thread_main(void* userdata) {
         if (SDL_GetAtomicInt(&r->gpu_stop)) break;
 
         if (SDL_GetAtomicInt(&s_sync_rb_pending)) {
-            s_sync_rb_ok = vkr_do_readback(r, s_sync_rb_x, s_sync_rb_y,
-                                           s_sync_rb_w, s_sync_rb_h, s_sync_rb_dest);
+            s_sync_rb_ok = vkr_service_sync_readback(r, s_sync_rb_slot, s_sync_rb_x, s_sync_rb_y,
+                                                     s_sync_rb_w, s_sync_rb_h, s_sync_rb_dest);
             SDL_SetAtomicInt(&s_sync_rb_pending, 0);
             SDL_LockMutex(r->gpu_mutex);
             SDL_SignalCondition(s_sync_rb_done);
@@ -1333,6 +1584,7 @@ static int vkr_thread_main(void* userdata) {
             vkDeviceWaitIdle(r->ctx.device);
             vk_swapchain_destroy(&r->ctx);
             vk_swapchain_create(&r->ctx, r->sdl_window);
+            s_rb_staged_slot = -1;
             SDL_LockMutex(r->gpu_mutex);
             r->frames_pending = 0;
             SDL_SignalCondition(r->frame_done);
@@ -1354,24 +1606,13 @@ static int vkr_thread_main(void* userdata) {
                                         .flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT };
         vkBeginCommandBuffer(cmd, &bi);
 
-        /* Replay in submission order. The op list exists precisely so a texture
-         * page uploaded halfway through a frame is only visible to the draws
-         * that were actually issued after it. */
-        bool rendering = false;
-        for (uint32_t i = 0; i < f->op_count; i++) {
-            if (f->ops[i].type == VKR_OP_VRAM_UPDATE) {
-                vkr_exec_vram_update(r, cmd, &f->vram_updates[f->ops[i].index], slot, &rendering);
-            } else {
-                /* Between batches, make the previous batch's writes visible to
-                 * this one's sampler: the glTextureBarrier() equivalent. */
-                if (rendering) {
-                    vkr_end_vram_rendering(cmd, &rendering);
-                    vkr_barrier_vram_feedback(cmd, &r->vram);
-                }
-                vkr_exec_batch(r, cmd, &f->batches[f->ops[i].index], slot, &rendering);
-            }
-        }
-        vkr_end_vram_rendering(cmd, &rendering);
+        /* Replay in submission order, from wherever a synchronous readback
+         * left the slot. The op list exists precisely so a texture page
+         * uploaded halfway through a frame is only visible to the draws that
+         * were actually issued after it. */
+        VkrReplay st = { false, true };
+        vkr_replay_slot(r, cmd, ri, slot, &st);
+        vkr_end_vram_rendering(cmd, &st.rendering);
         vkr_barrier_vram_feedback(cmd, &r->vram);
 
         /* Scanout. A blanked display is a cleared image, not a stale one:
@@ -1388,8 +1629,11 @@ static int vkr_thread_main(void* userdata) {
                                 &push, sizeof(push), dw, dh, f->disp_blank);
         }
 
-        /* VRAM viewer, for the debug workspace. */
-        {
+        /* VRAM viewer, for the debug workspace: only while it is on screen
+         * (view.enabled, from debug_ui.cpp). A 1024x512 fullscreen pass every
+         * field otherwise, the gameplay shell included. Skipping it leaves the
+         * viewer image in SHADER_READ_ONLY_OPTIMAL, where ImGui expects it. */
+        if (f->view.enabled) {
             VkrViewerPush push = {
                 .clut  = { f->view.clut_x, f->view.clut_y },
                 .flags = { f->view.greyscale ? 1 : 0, f->view.show_alpha ? 1 : 0, f->view.shift24 },
@@ -1494,9 +1738,11 @@ static int vkr_thread_main(void* userdata) {
 
         /* The async whole-VRAM readback the inspector's CPU-vs-GPU diff uses. */
         if (SDL_GetAtomicInt(&s_readback_request)) {
-            vkQueueWaitIdle(r->ctx.queue);
-            if (vkr_do_readback(r, 0, 0, VKR_VRAM_W, VKR_VRAM_H, s_readback_vram))
-                s_readback_seq++;
+            const int back = 1 - SDL_GetAtomicInt(&s_readback_pub);
+            if (vkr_readback_whole(r, s_readback_vram[back])) {
+                SDL_SetAtomicInt(&s_readback_pub, back);
+                SDL_AddAtomicInt(&s_readback_seq, 1);
+            }
             SDL_SetAtomicInt(&s_readback_request, 0);
         }
 
@@ -1506,6 +1752,8 @@ static int vkr_thread_main(void* userdata) {
         f->imgui_draw_data = NULL;
         s_vtx_used[ri] = 0;
         s_vram_pool_used[ri] = 0;
+        s_exec_from[ri] = 0;
+        s_rb_staged_slot = -1;   /* this frame rewrote the buffers a readback staged into */
 
         SDL_LockMutex(r->gpu_mutex);
         r->frames_pending = 0;
@@ -1529,6 +1777,8 @@ void vkr_start_gpu_thread(VkRenderer* r, SDL_Window* window) {
     SDL_SetAtomicInt(&r->gpu_stop, 0);
     r->write_idx = 0;
     r->frames_pending = 0;
+    s_exec_from[0] = s_exec_from[1] = 0;
+    s_rb_staged_slot = -1;
     r->gpu_thread = SDL_CreateThread(vkr_thread_main, "GPU-VK", r);
     if (!r->gpu_thread) LOG_RENDERER_ERROR("[VK] SDL_CreateThread: %s", SDL_GetError());
 }
@@ -1584,6 +1834,15 @@ bool vkr_read_vram_rect(VkRenderer* r, uint16_t* out,
     VKR_FLUSH(r);
 
     SDL_LockMutex(r->gpu_mutex);
+    /* The previous frame first. The render thread looks at a parked readback
+     * before it looks at a pending frame, so a request that arrives while a
+     * frame is still pending would be served from a VRAM image that does not
+     * yet hold that frame. Before main.c started emulating while the previous
+     * frame renders this could not happen (the frame was always done by the
+     * time the machine ran); now it can, and the GL backend has always waited
+     * here for the same reason. */
+    while (r->frames_pending > 0) SDL_WaitCondition(r->frame_done, r->gpu_mutex);
+    s_sync_rb_slot = r->write_idx;
     s_sync_rb_dest = out;
     s_sync_rb_x = x; s_sync_rb_y = y; s_sync_rb_w = w; s_sync_rb_h = h;
     s_sync_rb_ok = false;

@@ -111,6 +111,28 @@ void spu_transfer_write(Spu* spu, struct Interconnect* inter, uint16_t value) {
     spu->transfer_addr_reg = (uint16_t)(spu->transfer_addr / 8);
 }
 
+/* 1F801DA8h written while the transfer mode is Stop. The FIFO holds 32
+ * halfwords ("Data (max 32 halfwords)", soundprocessingunitspu.md:683); the
+ * documentation does not say what a 33rd write does, so it is dropped and
+ * logged rather than guessed at. */
+void spu_manual_fifo_push(Spu* spu, uint16_t value) {
+    if (spu->manual_fifo_count >= 32) {
+        LOG_SPU_WARN("[SPU] Manual-write FIFO full (32 halfwords), 0x%04X dropped", value);
+        return;
+    }
+    spu->manual_fifo[spu->manual_fifo_count++] = value;
+}
+
+/* Manual Write selected with halfwords waiting: they go to SPU RAM at the
+ * transfer address, in order, each one an access the IRQ address can trap,
+ * exactly as if they had been written in Manual Write mode (:715-721, :852). */
+void spu_manual_fifo_flush(Spu* spu, struct Interconnect* inter) {
+    uint8_t n = spu->manual_fifo_count;
+    spu->manual_fifo_count = 0;
+    for (uint8_t i = 0; i < n && i < 32; i++)
+        spu_transfer_write(spu, inter, spu->manual_fifo[i]);
+}
+
 uint16_t spu_transfer_read(Spu* spu, struct Interconnect* inter) {
     int mode = (spu->control >> 4) & 0x03;
     if (mode != TRANSFER_DMA_READ) return 0;

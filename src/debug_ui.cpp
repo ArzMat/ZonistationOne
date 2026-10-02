@@ -560,9 +560,27 @@ static void log_sink_callback(int category, int level, const char* msg, void* ud
     if (comp.next_seq - comp.first_seq > LOG_RING_CAP)
         comp.first_seq = comp.next_seq - LOG_RING_CAP;
 
+    /* No flush here. The file is fully buffered (see debug_ui_init) and
+     * debug_ui_flush_logs() empties every buffer once per field, so a burst of
+     * DEBUG lines costs one write() per 64 KB instead of one per line. The
+     * file used to be line-buffered, which made every emitted line a syscall
+     * on the emulation thread. writes_since_flush only tells the per-field
+     * flush which files have anything to write. */
     if (comp.file) {
         fprintf(comp.file, "[%s] %s\n", level_name(level), msg);
-        if (++comp.writes_since_flush >= 64) {
+        comp.writes_since_flush++;
+    }
+}
+
+/* Called once per field from the host loop (main.c), after the frame has been
+ * submitted: the logs on disk are at most one field behind the machine, which
+ * is the granularity anyone reading them can use, and the crash handlers in
+ * main.c flush whatever is still buffered on the way out. Takes the same lock
+ * the sink does, so a line the GPU thread is writing is never cut in half. */
+extern "C" void debug_ui_flush_logs(void) {
+    std::lock_guard<std::mutex> lock(g_log_mutex);
+    for (auto& comp : g_log_components) {
+        if (comp.file && comp.writes_since_flush) {
             fflush(comp.file);
             comp.writes_since_flush = 0;
         }
@@ -660,7 +678,7 @@ static const char* level_name(int level) {
  * log; the snapshot is a separate artefact and now says so in its name.
  *
  * The handle is flushed first, so the two files line up at the moment of the
- * snapshot instead of the streamed one trailing by up to 64 lines. */
+ * snapshot instead of the streamed one trailing by up to a field's lines. */
 static void export_component_log(LogComponent& comp) {
     mkdir("logs", 0755);
     char path[160];
@@ -1280,7 +1298,7 @@ static void draw_lua_console_window(void) {
 // ---------------------------------------------------------------------------
 
 // VRAM viewer state — mirrors PCSX-Redux's vram-viewer widget controls.
-static VramViewParams g_vram_view = { VRAM_VIEW_16BPP, 0, false, false, 0, 0 };
+static VramViewParams g_vram_view = { VRAM_VIEW_16BPP, 0, false, false, 0, 0, false };
 static float  g_vram_zoom     = 1.0f;
 static ImVec2 g_vram_pan      = ImVec2(0, 0);   // in VRAM pixels, top-left of view
 static bool   g_vram_grid     = false;          // 16x16 pixel grid
@@ -1292,9 +1310,26 @@ static bool   g_vram_show_disp = true;          // outline the active display ar
 
 bool debug_ui_vram_viewer_open(void) { return g_show_vram_viewer; }
 
+/* Whether the viewer was drawn this frame. The renderer runs its decode pass (a
+ * 1024x512 fullscreen draw on the GPU thread) only while the params it is
+ * handed say enabled, so this frame's answer travels with the params: true from
+ * draw_vram_viewer_window(), false from vram_view_publish_hidden() on every
+ * frame that did not draw it, the gameplay shell included. Pushed every frame
+ * rather than on change, so a backend that has just been switched in cannot
+ * keep a stale "enabled" from before the switch. */
+static bool g_vram_viewer_drawn = false;
+
+static void vram_view_publish_hidden(Interconnect* inter) {
+    if (!inter || g_vram_viewer_drawn) return;
+    g_vram_view.enabled = false;
+    renderer_set_vram_view_params(&inter->gpu.renderer, &g_vram_view);
+}
+
 static void draw_vram_viewer_window(Renderer* renderer, Interconnect* inter) {
     if (!g_show_vram_viewer || !renderer) return;
 
+    g_vram_view.enabled = true;
+    g_vram_viewer_drawn = true;
     renderer_set_vram_view_params(renderer, &g_vram_view);
     GfxTexHandle tex = renderer_get_vram_viewer_texture(renderer);
 
@@ -3492,7 +3527,13 @@ extern "C" void debug_ui_init(SDL_Window* window, void* gl_context, int backend)
         snprintf(path, sizeof(path), "logs/%s.log", comp.name);
         comp.file = fopen(path, "w");
         if (comp.file) {
-            setvbuf(comp.file, NULL, _IOLBF, 4096);
+            /* Fully buffered, 64 KB. Line buffering turned every emitted line
+             * into a write() on whichever thread logged it; at DEBUG that is
+             * thousands of syscalls per field on the emulation thread. The
+             * buffer is emptied once per field (debug_ui_flush_logs) and by
+             * the signal handlers in main.c, so a crash or a Ctrl+C still
+             * leaves everything up to the last field on disk. */
+            setvbuf(comp.file, NULL, _IOFBF, 64 * 1024);
         }
     }
 
@@ -4191,6 +4232,7 @@ extern "C" void debug_ui_render(void* cpu_ptr, void* interconnect_ptr) {
     /* ImGui_ImplOpenGL3_NewFrame() moved to GPU thread — owns GL context */
     ImGui_ImplSDL3_NewFrame();
     ImGui::NewFrame();
+    g_vram_viewer_drawn = false;
 
     /* Two shells, one window. The gameplay shell draws the screen and its
      * overlay and nothing else — no dockspace, no rail, no log dock, so none of
@@ -4198,6 +4240,7 @@ extern "C" void debug_ui_render(void* cpu_ptr, void* interconnect_ptr) {
     if (g_shell == SHELL_GAMEPLAY) {
         draw_gameplay_shell(cpu, inter);
         gp_handle_keys(inter);
+        vram_view_publish_hidden(inter);
         ImGui::Render();
         return;
     }
@@ -4344,6 +4387,7 @@ extern "C" void debug_ui_render(void* cpu_ptr, void* interconnect_ptr) {
         }
     }
 
+    vram_view_publish_hidden(inter);
     ImGui::Render();
     /* ImGui_ImplOpenGL3_RenderDrawData moved to GPU thread via imgui_render_draw_data() */
 }

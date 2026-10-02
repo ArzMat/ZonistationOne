@@ -107,3 +107,11 @@ src/gpu/shaders/*.spv.h
 
 # Per-session memory cards, savestates and frame dumps written by cluster runs.
 cluster-data/
+
+# Unit test binaries and profile-guided optimisation data
+tests/bin/
+pgo/
+tests/hw/build/
+
+# Python bytecode (deploy/session/webrtc_server.py, tests/hw/elf2exe.py)
+__pycache__/

@@ -92,8 +92,9 @@ void renderer_submit_frame(Renderer* renderer, void* imgui_draw_data);
 
 /**
  * @brief Waits for the GPU thread to finish the most recently submitted frame.
- * Call at the START of each CPU frame, before ImGui::NewFrame(), to ensure
- * the previous frame's ImGui draw data is no longer in use.
+ * Call before ImGui::NewFrame(), to ensure the previous frame's ImGui draw
+ * data is no longer in use. main.c calls it after emulating the field, not
+ * before: emulation only records into the write slot and needs no wait.
  */
 void renderer_wait_frame_done(Renderer* renderer);
 

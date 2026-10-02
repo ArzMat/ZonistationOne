@@ -23,7 +23,7 @@ LIBS = $(SDL_LIBS) -lGL -lGLEW -lm -lpthread
 ifdef DEBUG
   OPT = -O0 -g
 else
-  OPT = -O3 -g -march=native -DNDEBUG $(LTO)
+  OPT = -O3 -g -march=native -DNDEBUG
 endif
 
 # Link-time optimisation.
@@ -44,24 +44,60 @@ endif
 # CPI stayed at 1.618 in all three, which is the check that the emulated machine
 # did not change: CPI is a guest property and no host optimisation may move it.
 #
-# LTO needs ONE toolchain for both languages. This machine has gcc 14.2 but g++
-# 13.3, and lto-wrapper refuses the mismatch outright:
+# LTO objects from two different gcc majors cannot meet in one link. This
+# machine has gcc 14.2 but g++ 13.3, and lto-wrapper refuses the mismatch:
 #   "bytecode stream in file 'src/main.o' generated with LTO version 14.0
 #    instead of the expected 13.1"
-# So enable it only when the two majors agree, and say so at build time rather
-# than failing the link — a default that does not build is not a default.
+# That used to switch LTO off altogether, so a plain `make` on that machine
+# built the slower binary.
 #
-# Force either way with `make LTO="-flto=auto"` or `make LTO=`. To get it on a
-# mismatched box, pick a matching pair:
+# Force it off with `make LTO=`; a matching pair still works as before:
 #   make clean && make CC=gcc-13 CXX=g++-13
+#
+# A mismatch no longer turns LTO off for the C side. Everything on the hot path
+# (interpreter, bus, GPU command decoder, SPU) is C; only ImGui and debug_ui.cpp
+# are C++, and they gain nothing from it. So with mismatched majors the C objects
+# are still built with -flto, the C++ objects without, and the link goes through
+# the C driver, whose lto-wrapper matches the C objects, with the C++ runtime
+# named by its full path (the C driver cannot find the unversioned libstdc++.so
+# of a different gcc on its own).
 CC_MAJOR  := $(shell $(CC) -dumpversion 2>/dev/null | cut -d. -f1)
 CXX_MAJOR := $(shell $(CXX) -dumpversion 2>/dev/null | cut -d. -f1)
 ifeq ($(CC_MAJOR),$(CXX_MAJOR))
-  LTO ?= -flto=auto
+  LTO     ?= -flto=auto
+  LTO_C   ?= $(LTO)
+  LTO_CXX ?= $(LTO)
+  LINK     = $(CXX)
+  LINK_LTO = $(LTO)
+  LINK_CXXRT =
 else
-  LTO ?=
-  $(info [build] LTO off: $(CC) is $(CC_MAJOR) but $(CXX) is $(CXX_MAJOR) — they must match.)
-  $(info [build]   retry with: make clean && make CC=gcc-$(CXX_MAJOR) CXX=g++-$(CXX_MAJOR))
+  LTO     ?= -flto=auto
+  LTO_C   ?= $(LTO)
+  LTO_CXX ?=
+  LINK     = $(CC)
+  LINK_LTO = $(LTO_C)
+  LINK_CXXRT = $(shell $(CXX) -print-file-name=libstdc++.so)
+  $(info [build] $(CC) is $(CC_MAJOR) but $(CXX) is $(CXX_MAJOR): LTO on for C only, linking with $(CC).)
+endif
+
+# Profile-guided optimisation, two builds around one representative run:
+#   make clean && make PGO_GEN=1     # instrumented binary
+#   ./ZoniStation_One ...            # 60 s of a fixed scene; writes pgo/*.gcda
+#   make clean && make PGO_USE=1     # optimised with that profile
+# The profile directory survives `make clean` on purpose.
+PGO_DIR = $(CURDIR)/pgo
+ifdef PGO_GEN
+  PGO_FLAGS = -fprofile-generate=$(PGO_DIR) -fprofile-update=atomic
+endif
+ifdef PGO_USE
+  PGO_FLAGS = -fprofile-use=$(PGO_DIR) -fprofile-partial-training -Wno-missing-profile
+endif
+
+# Highest log level compiled in. TRACE lines sit on per-instruction and
+# per-primitive paths, so a normal build drops them at compile time (include/log.h).
+# `make LOG_MAX_LEVEL=TRACE` puts them back for a tracing session.
+ifdef LOG_MAX_LEVEL
+  LOG_DEFS = -DZS1_LOG_MAX_LEVEL=LOG_LEVEL_$(LOG_MAX_LEVEL)
 endif
 
 # Header dependency tracking. Without it, `make` after editing anything in
@@ -122,14 +158,23 @@ GLSLFLAGS = -V --target-env vulkan1.3 -Isrc/gpu/shaders
 	@$(GLSLANG) $(GLSLFLAGS) -o $@ $< > /dev/null
 
 # Symbol name from the file: src/gpu/shaders/ps1.frag -> zs1_shader_ps1_frag
+# Written through a temporary file: a failed xxd (not installed) used to leave an
+# empty header behind, which the next build took as up to date.
 %.spv.h: %.spv
-	@xxd -i -n zs1_shader_$(subst .,_,$(notdir $*)) $< > $@
+	@xxd -i -n zs1_shader_$(subst .,_,$(notdir $*)) $< > $@.tmp && mv $@.tmp $@
 
 shaders: $(VK_SHADER_HDRS)
 .PHONY: shaders
 
-CFLAGS = -std=c99 $(OPT) -Wall -Wextra $(DEPFLAGS) $(INCLUDES) $(VK_INCLUDES) $(SDL_CFLAGS) $(VK_DEFS)
-CXXFLAGS = -std=c++11 $(OPT) -Wall -Wextra $(DEPFLAGS) $(INCLUDES) $(VK_INCLUDES) $(SDL_CFLAGS) $(VK_DEFS)
+ifdef DEBUG
+  LTO_C   :=
+  LTO_CXX :=
+  LINK_LTO :=
+endif
+
+CFLAGS = -std=c99 $(OPT) $(LTO_C) $(PGO_FLAGS) -Wall -Wextra $(DEPFLAGS) $(INCLUDES) $(VK_INCLUDES) $(SDL_CFLAGS) $(VK_DEFS) $(LOG_DEFS)
+CXXFLAGS = -std=c++11 $(OPT) $(LTO_CXX) $(PGO_FLAGS) -Wall -Wextra $(DEPFLAGS) $(INCLUDES) $(VK_INCLUDES) $(SDL_CFLAGS) $(VK_DEFS) $(LOG_DEFS)
+LDFLAGS_EMU = $(OPT) $(LINK_LTO) $(PGO_FLAGS)
 
 # Build every translation unit at once by default. The tree is ~90 objects and
 # they are independent; an explicit -j on the command line still wins, because
@@ -214,24 +259,24 @@ endif
 EMU_OBJS = $(EMU_C_SRCS:.c=.o) $(EMU_CXX_SRCS:.cpp=.o)
 EMU_BIN = ZoniStation_One
 
-# --- Test files ---
-TEST_SRCS = tests/cpu_minimal_test.c \
-    $(EMU_CPU_SRCS) src/core/interconnect.c src/core/bus.c src/core/bus_irq.c \
-    src/core/ram.c src/core/dma.c src/core/timers.c src/core/bios.c \
-    src/core/mdec.c src/core/debugger.c src/core/lua_debug.c $(EMU_LUA_SRCS) \
-    src/gte/gte.c src/gte/gte_ops.c src/utils/log.c \
-    src/gpu/gpu.c src/gpu/renderer.c src/gpu/renderer_gl.c src/gpu/vram.c \
-    src/spu/spu.c src/utils/rxi_log.c src/core/event_scheduler.c
-TEST_BIN = cpu_test
+# --- Unit tests (docs/TESTING_PLAN_2026-08-20.md, layer 1) ---
+#
+# Each tests/*_test.c is a self-contained program: it #includes the source file
+# under test and stubs the few functions that file calls outside itself, so a
+# test needs no SDL, no GL, no BIOS and no disc. `make test` builds and runs every
+# one of them and stops at the first failure.
+UNIT_TEST_SRCS := $(wildcard tests/*_test.c)
+UNIT_TEST_BINS := $(patsubst tests/%.c,tests/bin/%,$(UNIT_TEST_SRCS))
+TEST_CFLAGS = -std=c99 -O2 -g -Wall -Wextra -MMD -MP -Iinclude
 
-TEST_OBJS = $(TEST_SRCS:.c=.o)
+tests/bin/%: tests/%.c
+	@mkdir -p tests/bin
+	$(CC) $(TEST_CFLAGS) -o $@ $< -lm
 
-# Every object either target can build, so the .d files are picked up whichever
-# one was made last.
-ALL_OBJS = $(sort $(EMU_OBJS) $(TEST_OBJS))
-DEPS = $(ALL_OBJS:.o=.d)
+ALL_OBJS = $(EMU_OBJS)
+DEPS = $(ALL_OBJS:.o=.d) $(wildcard tests/bin/*.d)
 
-.PHONY: all test clean compile_commands
+.PHONY: all test hwtest clean compile_commands
 
 # `compile_commands` is defined before `all`, and make takes the FIRST real
 # target as the default goal — so a bare `make` regenerated compile_commands.json
@@ -266,11 +311,14 @@ compile_commands:
 
 ifdef ENABLE_VULKAN
 all: $(VK_SHADER_HDRS)
+# renderer_vk.c #includes the generated headers, which -MMD cannot know about
+# before they exist: without this edge a parallel build could compile it first.
+src/gpu/vk/renderer_vk.o: $(VK_SHADER_HDRS)
 endif
 all: $(EMU_BIN)
 
 $(EMU_BIN): $(EMU_OBJS)
-	$(CXX) -o $@ $^ $(CXXFLAGS) $(LIBS)
+	$(LINK) -o $@ $^ $(LDFLAGS_EMU) $(LIBS) $(LINK_CXXRT)
 
 %.o: %.c
 	$(CC) -c $< -o $@ $(CFLAGS)
@@ -278,17 +326,22 @@ $(EMU_BIN): $(EMU_OBJS)
 %.o: %.cpp
 	$(CXX) -c $< -o $@ $(CXXFLAGS)
 
-test: $(TEST_BIN)
-	./$(TEST_BIN)
+test: $(UNIT_TEST_BINS)
+	@for t in $(UNIT_TEST_BINS); do echo "== $$t"; ./$$t || exit 1; done
+	@echo "all $(words $(UNIT_TEST_BINS)) unit tests passed"
 
-$(TEST_BIN): $(TEST_OBJS)
-	$(CC) -o $@ $^ $(CFLAGS) $(LIBS)
+# Bare-metal hardware tests (layer 2): small PS-X EXEs run inside the emulator
+# on a zero-filled BIOS, on both renderers. Needs gcc-mipsel-linux-gnu and
+# xvfb-run; see tests/hw/README.md.
+hwtest: $(EMU_BIN)
+	tests/hw/run.sh ./$(EMU_BIN)
 
 split_log: split_log.c
 	$(CC) -o split_log split_log.c
 
 clean:
-	rm -f $(EMU_BIN) $(TEST_BIN) split_log \
+	rm -rf tests/bin tests/hw/build
+	rm -f $(EMU_BIN) split_log \
 	    src/gpu/shaders/*.spv src/gpu/shaders/*.spv.h \
 	    src/*.[od] src/cpu/*.[od] src/core/*.[od] src/gpu/*.[od] src/gte/*.[od] \
 	    src/cdrom/*.[od] src/spu/*.[od] src/utils/*.[od] tests/*.[od] \

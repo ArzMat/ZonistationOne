@@ -23,15 +23,14 @@ static inline bool CheckPendingInterrupt(Cpu* cpu) {
     // Per PSX-SPX: interrupt pending if (I_STAT & I_MASK) != 0 AND SR.IE == 1
     uint16_t i_stat = cpu->inter->irq_status;
     uint16_t i_mask = cpu->inter->irq_mask;
-    bool irq_pending = (i_stat & i_mask) != 0;
-    
+    const uint32_t ip2 = ((i_stat & i_mask) != 0) ? (1u << 10) : 0u;
+
     // Update COP0 Cause bit 10 (IP2) based on current state - NOT a latch!
-    if (irq_pending) {
-        cpu->cause |= (1u << 10);
-    } else {
-        cpu->cause &= ~(1u << 10);
-    }
-    
+    // Written only when it changes: the old unconditional set-or-clear was a
+    // read-modify-write of cpu->cause on every instruction for a bit that
+    // changes a few hundred times a field. Same value either way.
+    if ((cpu->cause ^ ip2) & (1u << 10)) cpu->cause ^= (1u << 10);
+
     // Check: SR.IEc && ((cause & sr) & 0xFF00) != 0
     bool sr_iec = (cpu->sr & 1) != 0;
     uint32_t sr_cause_masked = (cpu->sr & cpu->cause) & 0xFF00;
@@ -88,8 +87,10 @@ void cpu_flush_load_delay(Cpu* cpu) {
     }
 }
 
-// Main execution cycle - called for each instruction
-void cpu_run_next_instruction(Cpu* cpu) {
+/* One instruction. The body of cpu_run_next_instruction(), kept inline so the
+ * frame loop below runs it without a call per instruction (system.c used to
+ * call cpu_run_next_instruction() across a translation unit for every one). */
+static inline __attribute__((always_inline)) void cpu_step(Cpu* cpu) {
     // exception_pending is per-instruction state; clear it before running this step.
     cpu->exception_pending = false;
 
@@ -152,11 +153,23 @@ void cpu_run_next_instruction(Cpu* cpu) {
     // reflects fully-settled state — a debugger callback that runs any earlier
     // shows register values stale by one instruction for whatever the
     // immediately preceding instruction just wrote). ---
-    if (!cpu->inter->debugger.step_skip_bp) {
-        debugger_check_breakpoint(&cpu->inter->debugger, cpu);
-        if (cpu->inter->debugger.paused) return;
-    } else {
-        cpu->inter->debugger.step_skip_bp = false;
+    //
+    // Gated on the three things that can make it do anything: a breakpoint in
+    // the list, a pending step-off, or a pause already raised during this
+    // instruction (a read watchpoint can fire on the fetch above). With all
+    // three clear, debugger_check_breakpoint() finds the filter empty and
+    // returns, and `paused` is false, so skipping the call changes nothing;
+    // it was a cross-unit call and a hash per instruction, ~1% of samples.
+    {
+        Debugger* dbg = &cpu->inter->debugger;
+        if (__builtin_expect((dbg->breakpoint_count != 0) | dbg->step_skip_bp | dbg->paused, 0)) {
+            if (!dbg->step_skip_bp) {
+                debugger_check_breakpoint(dbg, cpu);
+                if (dbg->paused) return;
+            } else {
+                dbg->step_skip_bp = false;
+            }
+        }
     }
 
     // --- BIOS syscall side-channel capture (A0h/B0h/C0h) ---
@@ -226,6 +239,27 @@ void cpu_run_next_instruction(Cpu* cpu) {
         cpu->downcount = (next != UINT32_MAX && (int32_t)(next - now) > 0)
                        ? (int32_t)(next - now) : 1;
     }
+}
+
+// Main execution cycle - called for each instruction
+void cpu_run_next_instruction(Cpu* cpu) {
+    cpu_step(cpu);
+}
+
+/* Run until the VBlank event ends the field, the debugger pauses, or the safety
+ * cap is reached: the loop system_run_frame() used to drive one call at a
+ * time, with the same three tests after every instruction in the same order,
+ * so a breakpoint, a watchpoint or a Lua pause still stops the machine on the
+ * exact instruction it did before. Returns false when the stop was a pause,
+ * so the caller can skip its end-of-field work as it always has. */
+bool cpu_run_frame(Cpu* cpu, uint32_t start_cycle, uint32_t cap_cycles) {
+    Interconnect* inter = cpu->inter;
+    while (!inter->frame_complete) {
+        cpu_step(cpu);
+        if (inter->debugger.paused) return false;                  /* breakpoint hit mid-frame */
+        if (inter->cpu_cycle_counter - start_cycle >= cap_cycles) break;  /* safety */
+    }
+    return true;
 }
 
 // Safe memory peek for trace output — no bus side effects, no exceptions.

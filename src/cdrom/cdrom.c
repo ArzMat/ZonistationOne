@@ -144,13 +144,27 @@ void cdrom_command_event_tick(struct Interconnect *inter) {
 void cdrom_drive_event_tick(struct Interconnect *inter) {
     Cdrom *cdrom = &inter->cdrom;
     if (cdrom->interrupt_flag != 0) {
-        /* Drive event blocked by pending INT — retry after a short delay.
-           For CDDA there is no INT1, so don't retry there. */
-        if (cdrom->drive_state != DRIVE_PLAYING)
-            return;  /* INT ACK handler reschedules for reading */
-        /* For CDDA, try again shortly */
-        cdrom_schedule_drive_event(cdrom, CDROM_MIN_INT_DELAY);
-        return;
+        /* CD-DA has no INT1 to wait for: try again shortly. */
+        if (cdrom->drive_state == DRIVE_PLAYING) {
+            cdrom_schedule_drive_event(cdrom, CDROM_MIN_INT_DELAY);
+            return;
+        }
+        /* Reading. "The Read commands are continously receiving 75 sectors per
+         * second (or 150 sectors at double speed)" whatever the software is
+         * doing (psx-spx cdr/cdromdrive.md:758-765), and an XA-ADPCM sector
+         * raises no interrupt at all (:1132-1133). So a pending interrupt (an
+         * INT3 from a polling GetlocP, an INT1 not yet acknowledged) holds back
+         * only what it has to: the next *data* delivery. A sector bound for the
+         * ADPCM decoder, or one the XA filter throws away, is read and handled
+         * on time. Stopping the whole drive here put holes in XA speech for as
+         * long as any acknowledge took. ZS1_CD_XA_HOLD=1 restores that.
+         *
+         * A held data sector keeps drive_deadline as it is; the acknowledge
+         * re-arms on what is left of it (cdrom_rearm_drive_event), so nothing
+         * already owed is restarted. */
+        if (cdrom->drive_state == DRIVE_READING && !cdrom_xa_hold_legacy())
+            cdrom_execute_drive_int_pending(cdrom);
+        return;  /* otherwise the INT acknowledge reschedules */
     }
     cdrom_execute_drive(cdrom);
 }
@@ -177,7 +191,14 @@ void cdrom_init(Cdrom *cdrom, struct Interconnect *inter) {
     cdrom->second_response_cmd = CDC_NONE;
     cdrom->drive_state      = DRIVE_IDLE;
     cdrom->shell_open       = true;   /* no disc yet; cdrom_load_disc() clears it */
+    /* Output stage at power-up: ATV 80h,0,80h,0 is "normal stereo volume", 80h
+     * the "Default/Normal" level (psx-spx cdr/cdromdrive.md:231-232, :240), and
+     * the drive is demuted (:1028-1029). Now that the SPU applies this stage,
+     * these are what keep CD audio audible before a game touches it. The
+     * staged copies get the same values (as cdrom_reset gives them), so a
+     * CHNGATV written before any ATV port cannot commit an all-zero matrix. */
     cdrom->vol_ll = cdrom->vol_rr = 0x80;
+    cdrom->vol_ll_t = cdrom->vol_rr_t = 0x80;
     fifo_init(&cdrom->param_fifo);
     fifo_init(&cdrom->response_fifo);
     cdrom_audio_init(&cdrom->audio_fifo, &cdrom->xa_adpcm_state);
@@ -291,6 +312,7 @@ uint8_t cdrom_read8(Cdrom *cdrom, uint32_t addr) {
         /* Status register */
         SectorBuffer *sb = &cdrom->sector_buffers[cdrom->current_read_buffer];
         uint8_t st = cdrom->index & STAT_INDEX_MASK;
+        if (cdrom_xa_playing(cdrom))              st |= STAT_ADPBUSY;
         if (fifo_is_empty(&cdrom->param_fifo))    st |= STAT_PRMEMPT;
         if (!fifo_is_full(&cdrom->param_fifo))    st |= STAT_PRMWRDY;
         if (!fifo_is_empty(&cdrom->response_fifo)) st |= STAT_RSLRRDY;
@@ -460,35 +482,46 @@ bool cdrom_has_pending_interrupt(Cdrom *cdrom) {
     return (cdrom->interrupt_flag & cdrom->interrupt_enable) != 0;
 }
 
+/* HSTS.2 ADPBUSY, "ADPCM busy (R, 1=playing XA-ADPCM)" (psx-spx
+ * cdr/cdromdrive.md:62). It keeps working under Mute, which "is just forcing
+ * the CD output volume to zero" (:1020-1022), so the mute flags play no part.
+ * It was never set.
+ *
+ * "Playing" is taken conservatively, from state that exists without adding any:
+ * XA-ADPCM enabled, the drive reading, and decoded XA audio still queued for the
+ * SPU. The FIFO can run dry for a few samples between two XA sectors (the SPU
+ * drains it in 64-sample batches while a sector lands 2352 frames at once), so
+ * the bit can drop for that long inside a stream; it never reads 1 when no
+ * decoded XA audio is waiting. */
+bool cdrom_xa_playing(const Cdrom *cdrom) {
+    return cdrom->xa_adpcm_enable &&
+           cdrom->drive_state == DRIVE_READING &&
+           cdrom->audio_fifo.count > 0;
+}
+
 /* =========================================================================
- * Audio Frame (called by SPU/SDL)
+ * Audio output stage (called by the SPU for every frame it takes)
  * ========================================================================= */
 
-static inline int16_t cdrom_sat16(int32_t v) {
-    return (int16_t)(v < -32768 ? -32768 : (v > 32767 ? 32767 : v));
+/* Mute (command 0Bh) silences CD-DA and XA alike, ADPMUTE (ADPCTL.0) only
+ * XA-ADPCM (psx-spx cdr/cdromdrive.md:1018-1022, :251). Both force the output
+ * volume to zero while the controller keeps processing sectors, so the FIFO
+ * keeps being fed and only its output is silenced. The FIFO does not tag a
+ * frame's source; during Play it carries CD-DA, otherwise XA. The matrix is
+ * cdrom_audio_apply_output. */
+void cdrom_apply_output_volume(const Cdrom *cdrom, int16_t *left, int16_t *right) {
+    bool xa_source = cdrom->drive_state != DRIVE_PLAYING;
+    bool muted = cdrom->muted || (cdrom->xa_mute && xa_source);
+    cdrom_audio_apply_output(left, right, muted,
+                             cdrom->vol_ll, cdrom->vol_lr, cdrom->vol_rl, cdrom->vol_rr);
 }
 
 void cdrom_get_audio_frame(Cdrom *cdrom, int16_t *left, int16_t *right) {
     int16_t l = 0, r = 0;
     cdrom_audio_get_frame(&cdrom->audio_fifo, &l, &r);
-
-    /* Muting forces the output volume to zero — the controller keeps processing
-     * audio sectors internally (cdromdrive.md:1018-1022). It used to be applied
-     * by not pushing samples at all, which starved the FIFO instead of feeding
-     * it silence and left the resampler's history frozen across the mute. */
-    if (cdrom->muted || cdrom->xa_mute) { *left = 0; *right = 0; return; }
-
-    /* ATV0-ATV3 volume matrix (cdromdrive.md:227-247): 80h is normal, FFh is
-     * double, and the hardware saturates properly up to double volume — which
-     * is what clamping the 16-bit sum gives. Nothing read these four registers
-     * before, so Spyro's mono option and Resident Evil 2's CD fades (:243-247)
-     * had no effect whatsoever. */
-    int32_t out_l = ((int32_t)l * (int32_t)cdrom->vol_ll +
-                     (int32_t)r * (int32_t)cdrom->vol_lr) >> 7;
-    int32_t out_r = ((int32_t)l * (int32_t)cdrom->vol_rl +
-                     (int32_t)r * (int32_t)cdrom->vol_rr) >> 7;
-    *left  = cdrom_sat16(out_l);
-    *right = cdrom_sat16(out_r);
+    cdrom_apply_output_volume(cdrom, &l, &r);
+    *left  = l;
+    *right = r;
 }
 
 /* =========================================================================

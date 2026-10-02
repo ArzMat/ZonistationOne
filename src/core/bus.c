@@ -33,8 +33,10 @@ uint32_t mask_region(uint32_t addr) {
 }
 
 // --- Forward declarations ---
+static uint32_t ram_load_stall(void);
 static void interconnect_perform_dma(Interconnect* inter, uint32_t channel_index);
 static uint32_t dma_get_transfer_size_words(DmaChannel* ch);
+static bool dma_slice_in_flight(const Dma* dma, uint32_t channel_index);
 
 // =============================================================================
 // HW DISPATCH TABLE  (indexed by 16-byte block)
@@ -112,6 +114,11 @@ void bus_hw_tables_init(void) {
     HW_SET(0x1F801820, 0x1F801830, hw_mdec_read,      hw_mdec_write);
     // SPU      0x1F801C00-0x1F801E7F  (indices 0xC0-0xE7)
     HW_SET(0x1F801C00, 0x1F801E80, hw_spu_read,       hw_spu_write);
+
+    /* Settle the RAM load stall (and its ZS1_RAM_LOAD_STALL override) now,
+     * before the first instruction, so g_bus_ram_load_stall holds the final
+     * value for the CPU's RAM fast path (cpu_mem.h) from the very first load. */
+    (void)ram_load_stall();
 }
 
 // =============================================================================
@@ -250,12 +257,14 @@ static void hw_irq_write(Interconnect* inter, uint32_t addr, uint32_t val, BusSi
             if (cleared & (1u << i)) LOG_IRQ_DEBUG("%s IRQ cleared", names[i]);
         inter->irq_status    &= wv;
         inter->irq_line_state &= wv;  // allow re-fire: next set_irq_line(true) is fresh edge
-        if ((cleared & (1u << IRQ_SPU)) && inter->spu.irq9_flag) {
-            inter->spu.irq9_flag  = false;
-            inter->spu.status    &= ~SPU_STATUS_IRQ9_FLAG;
-            interconnect_set_irq_line(inter, IRQ_SPU, false);
-            LOG_IRQ_DEBUG("SPU IRQ9 edge-trigger reset");
-        }
+        /* The SPU's own IRQ9 flag is not touched here. Interrupts other than
+         * IRQ0/4/5/6 "must be additionally acknowledged at the I/O port that
+         * has caused them" (psx-spx system/interrupts.md:34-36), and for the
+         * SPU that port is SPUCNT.6 = 0 (spu/soundprocessingunitspu.md:635,
+         * :655), handled in spu_set_control. Clearing the flag on the I_STAT
+         * write gave the SPU an extra acknowledge, so a handler that checked
+         * SPUSTAT.6 after acking I_STAT found it already clear. While the flag
+         * stays set the SPU raises no new edge, as on hardware. */
         if (inter->cpu) inter->cpu->downcount = 0;
     } else if (addr == IRQ_MASK_ADDR) {
         inter->irq_mask = (uint16_t)(val & 0x7FF);
@@ -307,10 +316,16 @@ static void hw_dma_write(Interconnect* inter, uint32_t addr, uint32_t val, BusSi
             LOG_DMA_DEBUG("[DMA] ch%u blocked by DPCR", ch);
         }
     } else if (off == 0x70) {
-        // DPCR write: unblock any already-active channels
+        /* DPCR write: start the channels that were waiting for their Master
+         * Enable ("A channel started while its Master Enable is off waits, and
+         * begins when the enable bit is set", psx-spx system/dmachannels.md:
+         * 121-122). A channel whose sliced transfer is already running is not
+         * waiting: it used to be kicked again here, which for GPU DMA drained
+         * the transfer and then started it over from MADR, sending it twice. */
         for (uint32_t i = 0; i < 7; i++) {
             if (((inter->dma.control >> (i * 4 + 3)) & 1u) &&
-                dma_channel_is_active(&inter->dma.channels[i])) {
+                dma_channel_is_active(&inter->dma.channels[i]) &&
+                !dma_slice_in_flight(&inter->dma, i)) {
                 LOG_DMA_DEBUG("[DMA] DPCR write: ch%u unblocked", i);
                 interconnect_perform_dma(inter, i);
             }
@@ -381,7 +396,25 @@ static void hw_gpu_write(Interconnect* inter, uint32_t addr, uint32_t val, BusSi
 
 // --- MDEC (0x1F801820-0x1F80182F) ---
 static uint32_t hw_mdec_read(Interconnect* inter, uint32_t addr, BusSize sz) {
-    uint32_t v32 = mdec_read(&inter->mdec, addr);
+    /* "I/O ports can be read in 8bit, 16bit, or 32bit units, regardless of
+     * their size" (psx-spx system/unpredictablethings.md:58-60): a narrower read
+     * returns its part of the 32-bit register. mdec_read() only knows the two
+     * word addresses, so 1F801822h and 1F801826h read 0 and an lhu of the
+     * status' upper half (busy, DREQ, FIFO flags) always saw "idle".
+     *
+     * The data port is the exception: a read of it pops the output FIFO, and
+     * how a narrow read advances that FIFO on hardware is not documented. The
+     * conservative reading is one word per word's worth of reads: a narrow read
+     * that starts the word (1F801820h) pops it, and the reads of its other
+     * bytes (1F801821h..1F801823h) return parts of that same word, so an lhu
+     * pair at 820h/822h takes one word, not two. */
+    static uint32_t s_data_word;          /* word the last narrow data read popped */
+    if (sz != BUS_WORD && (addr & ~3u) == 0x1F801820u) {
+        if ((addr & 3u) == 0) s_data_word = mdec_read(&inter->mdec, 0x1F801820u);
+        if (sz == BUS_HWORD) return (uint16_t)(s_data_word >> ((addr & 2) << 3));
+        return (uint8_t)(s_data_word >> ((addr & 3) << 3));
+    }
+    uint32_t v32 = mdec_read(&inter->mdec, addr & ~3u);
     if (sz == BUS_WORD)  return v32;
     if (sz == BUS_HWORD) return (uint16_t)(v32 >> ((addr & 2) << 3));
     return (uint8_t)(v32 >> ((addr & 3) << 3));
@@ -529,6 +562,13 @@ static inline void sp_store16(Interconnect* i, uint32_t off, uint16_t v) {
  * plus nothing. The default stays 3.
  *
  * Read once and cached; the load path is the hottest in the emulator. */
+/* The same figure, exported for the CPU's own RAM fast path (cpu_mem.h), which
+ * charges it inline instead of calling in here. ram_load_stall() is the only
+ * writer, and bus_hw_tables_init() calls it before the CPU runs, so the two can
+ * never disagree. The DMA loops do not use it: they still go through
+ * interconnect_load32() (see cpu_mem.h for why). */
+uint32_t g_bus_ram_load_stall = RAM_LOAD_STALL;
+
 static uint32_t ram_load_stall(void) {
     static int cached = -1;
     if (cached < 0) {
@@ -537,10 +577,109 @@ static uint32_t ram_load_stall(void) {
         if (v < 0)  v = 0;
         if (v > 64) v = 64;      /* absurd values are a typo, not an intent */
         cached = (int)v;
+        g_bus_ram_load_stall = (uint32_t)v;
         if (s) LOG_INTERCONNECT_INFO("[BUS] ZS1_RAM_LOAD_STALL=%d extra cycles per RAM load "
                                      "(default %u)", cached, (unsigned)RAM_LOAD_STALL);
     }
     return (uint32_t)cached;
+}
+
+/* =============================================================================
+ * DMA COST TO THE CPU - ZS1_DMA_STALL=doc (opt-in)
+ * =============================================================================
+ *
+ * What the CPU pays for DMA today is an accident. Every word a transfer reads
+ * from RAM goes through interconnect_load32(), which charges the CPU the same
+ * load stall an lw would (bus_charge_cpu_load below), so a 320x240 24bpp frame
+ * pushed to the GPU costs the CPU about 3 cycles a word. The "downcount -="
+ * lines in the DMA paths look like the intended cost, but the dispatch that
+ * follows recomputes downcount from cpu_cycle_counter, which they never
+ * advanced, so they change nothing.
+ *
+ * The documented model is different (psx-spx system/dmachannels.md):
+ *   - transfer rates, per 100h words: 110h clocks for MDEC in/out, GPU and OTC
+ *     (1 clock a word plus a DRAM row load every 16), 420h for the SPU, 1400h
+ *     for PIO, and for the CDROM whatever its Memory Control delay gives,
+ *     24 clocks a word with the BIOS setting and 40 with what games set
+ *     (:205-213, :217, :222, :225-229);
+ *   - "CPU is running during DMA within very strict rules. It can be kept
+ *     running when accessing only cache, scratchpad, COP0 and GTE. ... Any read
+ *     access from RAM or I/O registers ... will stall the CPU until the DMA is
+ *     finished" (:231-238), and it resumes between SyncMode 1 blocks and
+ *     linked-list entries (:242-244).
+ *
+ * With ZS1_DMA_STALL=doc, each transfer, or each slice of a sliced one, opens a
+ * busy window of its documented duration starting now; the words themselves
+ * are read without charging the CPU; and the first CPU read from RAM or the
+ * I/O window that lands inside an open window waits for the rest of it. That
+ * includes instruction fetches that miss the cache, which reach RAM through
+ * the same load path; hits do not, which is the "accessing only cache" case.
+ * The slices are the gaps the CPU gets back: the next slice is scheduled when
+ * the current window ends.
+ *
+ * Not modelled: the 4-entry write queue filling up (:234-238), which would need
+ * the CPU's store side, and the few cycles a DMA6 takes to start (:239-241).
+ *
+ * It changes emulated timing everywhere, so it stays opt-in until boot
+ * milestones have been measured against the reference run (CLAUDE.md). With
+ * the variable unset nothing here runs and the accidental stall above is kept
+ * exactly as it was. */
+static int      s_dma_stall_doc = -1;
+/* Not static: the CPU's RAM fast path (cpu_mem.h) must fall back to the full
+ * load while a window is open, or its reads would never wait. */
+bool            g_bus_dma_window_open = false;   /* only ever true in the doc model */
+static uint32_t s_dma_window_end;            /* cpu_cycle_counter the window ends at */
+
+static bool dma_stall_doc(void) {
+    if (s_dma_stall_doc < 0) {
+        const char* v = getenv("ZS1_DMA_STALL");
+        s_dma_stall_doc = (v && strcmp(v, "doc") == 0) ? 1 : 0;
+        if (s_dma_stall_doc)
+            LOG_INTERCONNECT_INFO("[BUS] ZS1_DMA_STALL=doc: DMA reads RAM without charging the "
+                                  "CPU; a CPU read of RAM or I/O waits for the transfer to end");
+    }
+    return s_dma_stall_doc != 0;
+}
+
+/* A savestate load replaces the cycle counter, so a window opened before the
+ * load would make the first read after it wait until a cycle that belongs to
+ * the old timeline. Transfers restored from the state reopen their windows
+ * when their next slice runs. */
+void dma_doc_window_reset(void) {
+    g_bus_dma_window_open = false;
+    s_dma_window_end = 0;
+}
+
+/* Open (or extend) the busy window: the transfer runs from now for `ticks`.
+ * "Now" includes what the current instruction already owes, since a kick from
+ * a CHCR store happens inside the instruction, before that cost is added. */
+static void dma_doc_busy_for(Interconnect* inter, uint32_t ticks) {
+    if (ticks == 0 || !dma_stall_doc()) return;
+    const uint32_t end = inter->cpu_cycle_counter + inter->cpu_mem_stall_cycles + ticks;
+    if (!g_bus_dma_window_open || (int32_t)(end - s_dma_window_end) > 0)
+        s_dma_window_end = end;
+    g_bus_dma_window_open = true;
+}
+
+/* A CPU read while a window is open: RAM and the I/O ports wait for the rest of
+ * it (:237-238); scratchpad, ROM and the expansion areas do not. Out of line: it
+ * only runs while a window is open, which never happens by default.
+ *
+ * The wait goes straight onto the cycle counter, the way cpu_icache.c charges a
+ * ROM fetch, rather than into cpu_mem_stall_cycles: an instruction fetch puts
+ * that accumulator back after the load (it is for data costs only), which would
+ * drop the wait, and an I/O read made after waiting should see the time it was
+ * made at (a timer read, say). Events still only dispatch between
+ * instructions, so nothing fires inside the wait. */
+static void __attribute__((noinline)) dma_doc_cpu_read(Interconnect* inter, uint32_t phys) {
+    if (!(phys < 0x00800000u || (phys >= 0x1F801000u && phys < 0x1F802000u))) return;
+    const uint32_t now  = inter->cpu_cycle_counter + inter->cpu_mem_stall_cycles;
+    const int32_t  left = (int32_t)(s_dma_window_end - now);
+    if (left > 0) {
+        inter->cpu_cycle_counter += (uint32_t)left;
+        if (inter->cpu) inter->cpu->downcount -= left;
+    }
+    g_bus_dma_window_open = false;   /* the CPU is at or past the end of it now */
 }
 
 /* RAM_SIZE bit 7 gates the documented contention cycle. hw_memctrl2_read returns
@@ -550,6 +689,8 @@ static uint32_t ram_load_stall(void) {
 static inline void bus_charge_cpu_load(Interconnect* inter, uint32_t phys) {
     if (phys < 0x00800000)                   /* main RAM, mirrored */
         inter->cpu_mem_stall_cycles += ram_load_stall();
+    if (g_bus_dma_window_open)                   /* ZS1_DMA_STALL=doc only, see above */
+        dma_doc_cpu_read(inter, phys);
     /* BIOS ROM *data* reads stay free. Tried 2026-08-17 (one extra comparison
      * here, charging inter->bios_access_cycles): it did not reproduce the old
      * "killed controller input" claim — the pad kept polling 32 times a field —
@@ -778,6 +919,33 @@ void interconnect_store8(Interconnect* inter, uint32_t address, uint8_t value) {
 
 static uint32_t dma_ram_ticks(uint32_t words) { return words + (words + 15u) / 16u; }
 
+/* A word of RAM read by a DMA transfer. By default this is the CPU's own load
+ * path, which also charges the CPU a load stall per word: that accidental cost
+ * is what DMA costs the CPU today, and it is kept bit for bit. Under
+ * ZS1_DMA_STALL=doc the transfer reads RAM directly (no CPU stall, no read
+ * watchpoint) and the CPU pays through the busy window instead. Callers have
+ * already checked the address against DMA_RAM_LIMIT, the 8 MB mirror. */
+static inline uint32_t dma_ram_read32(Interconnect* inter, uint32_t addr) {
+    if (dma_stall_doc()) return ram_load32(inter->ram, addr & (RAM_SIZE - 1));
+    return interconnect_load32(inter, addr);
+}
+
+/* Documented duration of `words` words on a channel, for the doc model's busy
+ * window (psx-spx system/dmachannels.md:205-213, per 100h words). */
+static uint32_t dma_doc_ticks(const Interconnect* inter, uint32_t channel, uint32_t words) {
+    switch (channel) {
+        case 3:  /* "CDROM/SPU/PIO timings can be configured via Memory Control
+                  * registers" (:222): the CDROM delay register's word time is 24
+                  * with the BIOS setting and 40 with the one games use, the two
+                  * figures of :208-209. */
+                 return words * calc_memory_timing_word_cycles(inter->memctrl_regs[6],
+                                                               inter->memctrl_regs[8]);
+        case 4:  return (uint32_t)(((uint64_t)words * 0x420u + 0xFFu) / 0x100u);
+        case 5:  return words * 20u;
+        default: return dma_ram_ticks(words);   /* 110h per 100h words */
+    }
+}
+
 /* Signal DMA ch2 completion IRQ */
 static void dma_ch2_signal_done(Interconnect* inter) {
     DmaChannel* ch = &inter->dma.channels[2];
@@ -812,7 +980,7 @@ static bool dma_gpu_run_slice(Interconnect* inter, uint32_t* words_out) {
                 dma->gpu_ll_active = false;
                 return true;
             }
-            uint32_t header    = interconnect_load32(inter, addr);
+            uint32_t header    = dma_ram_read32(inter, addr);
             uint32_t num_words = header >> 24;
             uint32_t raw_next  = header & 0x00FFFFFF;
             uint32_t next_addr = raw_next & 0x00FFFFFC;
@@ -824,21 +992,25 @@ static bool dma_gpu_run_slice(Interconnect* inter, uint32_t* words_out) {
                     dma->gpu_ll_active = false;
                     return true;
                 }
-                gpu_gp0(&inter->gpu, interconnect_load32(inter, addr));
+                gpu_gp0(&inter->gpu, dma_ram_read32(inter, addr));
                 words_done++;
             }
 
             /* FFFFFFh is the clean end marker. Any other address past 8 MB also
              * ends the transfer, but as a bus error the guest can see in DICR
              * (dmachannels.md:186-192) — some games end a chain that way. */
+            /* gpu_ll_addr keeps the marker that ended the list: MADR holds
+             * "the end marker in SyncMode=2" (dmachannels.md:27-29). */
             if (raw_next == 0x00FFFFFFu) {
                 LOG_DMA_TRACE("[DMA] GPU LL done after %u words (sliced)", words_done);
+                dma->gpu_ll_addr   = raw_next;
                 dma->gpu_ll_active = false;
                 return true;
             }
             if (next_addr >= DMA_RAM_LIMIT) {
                 LOG_DMA_DEBUG("[DMA] GPU LL ended on out-of-range next 0x%06x", raw_next);
                 dma_flag_bus_error(dma);
+                dma->gpu_ll_addr   = raw_next;
                 dma->gpu_ll_active = false;
                 return true;
             }
@@ -860,7 +1032,7 @@ static bool dma_gpu_run_slice(Interconnect* inter, uint32_t* words_out) {
                 dma->gpu_req_active = false;
                 return true;
             }
-            gpu_gp0(&inter->gpu, interconnect_load32(inter, cur));
+            gpu_gp0(&inter->gpu, dma_ram_read32(inter, cur));
             addr = (uint32_t)((int32_t)addr + dma->gpu_req_step);
             remaining--;
             words_done++;
@@ -896,10 +1068,21 @@ void dma_gpu_resume(struct Interconnect* inter) {
         const char* v = getenv("ZS1_DMA_GPU_PACE");
         legacy = (v && v[0] == 'l') ? 1 : 0;
     }
+    const bool was_ll  = inter->dma.gpu_ll_active;
+    const bool was_req = inter->dma.gpu_req_active;
     uint32_t words = 0;
     bool done = dma_gpu_run_slice(inter, &words);
     uint32_t ticks = legacy ? DMA_SLICE_CYCLES : (words ? dma_ram_ticks(words) : 1u);
     if (inter->cpu) inter->cpu->downcount -= (int32_t)ticks;
+    dma_doc_busy_for(inter, dma_ram_ticks(words));
+
+    /* MADR follows the list: the node the next slice starts from, then the end
+     * marker (dmachannels.md:27-29). SyncMode 1 through dma_writeback. */
+    if (was_ll)
+        dma_writeback_list(&inter->dma, 2, inter->dma.gpu_ll_addr);
+    else if (was_req)
+        dma_writeback(&inter->dma, 2, inter->dma.gpu_req_addr,
+                      inter->dma.gpu_req_active ? inter->dma.gpu_req_remaining : 0u);
     if (done) {
         dma_ch2_signal_done(inter);
     } else {
@@ -940,7 +1123,7 @@ static bool dma_mdec_run_slice(Interconnect* inter, uint32_t* words_moved) {
                 remaining = 0;
                 break;
             }
-            mdec_dma_in(&inter->mdec, interconnect_load32(inter, cur));
+            mdec_dma_in(&inter->mdec, dma_ram_read32(inter, cur));
             addr = (uint32_t)((int32_t)addr + dma->mdec_in_step);
             remaining--;
             words_done++;
@@ -997,6 +1180,14 @@ void dma_mdec_resume(struct Interconnect* inter) {
     bool was_out = inter->dma.mdec_out_active;
     uint32_t words = 0;
     bool done = dma_mdec_run_slice(inter, &words);
+    dma_doc_busy_for(inter, dma_ram_ticks(words));
+    /* MADR/BCR move with the transfer (dmachannels.md:27-29, :56-58). */
+    if (was_in)
+        dma_writeback(&inter->dma, 0, inter->dma.mdec_in_addr,
+                      inter->dma.mdec_in_active ? inter->dma.mdec_in_remaining : 0u);
+    if (was_out)
+        dma_writeback(&inter->dma, 1, inter->dma.mdec_out_addr,
+                      inter->dma.mdec_out_active ? inter->dma.mdec_out_remaining : 0u);
     if (was_in  && !inter->dma.mdec_in_active)  dma_mdec_signal_done(inter, 0);
     if (was_out && !inter->dma.mdec_out_active) dma_mdec_signal_done(inter, 1);
     if (!done) {
@@ -1065,16 +1256,25 @@ static void interconnect_perform_dma(Interconnect* inter, uint32_t channel_index
             return;
         }
         LOG_DMA_DEBUG("[DMA] ch2 kick while slice in flight — draining first");
-        uint32_t guard = 0;
-        while (!dma_gpu_run_slice(inter, NULL) && ++guard < 65536) { /* drain */ }
+        /* No MADR/BCR writeback for the drained transfer (dma_gpu_run_slice
+         * does not do it): the guest has just written the registers for the
+         * new one. */
+        uint32_t guard = 0, drained = 0, w = 0;
+        while (!dma_gpu_run_slice(inter, &w) && ++guard < 65536) drained += w;
+        drained += w;
         if (guard >= 65536)
             LOG_DMA_ERROR("[DMA] ch2 drain gave up after %u slices", guard);
+        dma_doc_busy_for(inter, dma_ram_ticks(drained));
         dma_ch2_signal_done(inter);
     }
 
     LOG_DMA_DEBUG("[DMA] ch%d start", channel_index);
+    dma_writeback_begin(channel_index);
     DmaChannel* ch = &inter->dma.channels[channel_index];
     DmaSync sync_mode = ch->sync;
+    /* Generic path: where the transfer stopped, for the MADR/BCR writeback. */
+    bool     have_progress = false;
+    uint32_t moved_words = 0, next_addr = 0;
 
     LOG_DMA_DEBUG("[DMA] ch%d sync=%d dir=%d base=0x%08x",
                   channel_index, sync_mode, ch->direction, ch->base_addr);
@@ -1118,17 +1318,19 @@ static void interconnect_perform_dma(Interconnect* inter, uint32_t channel_index
                 LOG_DMA_DEBUG("[DMA] GPU REQUEST/MANUAL FROM_RAM: %u words", words_to_transfer);
                 inter->dma.gpu_ll_active  = false;
                 inter->dma.gpu_req_active = false;
-                uint32_t cur_addr = addr;
-                for (uint32_t i = 0; i < words_to_transfer; i++) {
+                uint32_t cur_addr = addr, moved = 0;
+                for (; moved < words_to_transfer; moved++) {
                     uint32_t cur = cur_addr & 0x00FFFFFC;
                     if (cur >= DMA_RAM_LIMIT) {
                         LOG_DMA_ERROR("[DMA] GPU req: addr 0x%08x out of bounds", cur);
                         dma_flag_bus_error(&inter->dma);
                         break;
                     }
-                    gpu_gp0(&inter->gpu, interconnect_load32(inter, cur));
+                    gpu_gp0(&inter->gpu, dma_ram_read32(inter, cur));
                     cur_addr = (uint32_t)((int32_t)cur_addr + step);
                 }
+                dma_doc_busy_for(inter, dma_ram_ticks(moved));
+                dma_writeback(&inter->dma, 2, cur_addr, words_to_transfer - moved);
                 dma_ch2_signal_done(inter);
                 return;
             }
@@ -1163,7 +1365,8 @@ static void interconnect_perform_dma(Interconnect* inter, uint32_t channel_index
                           sync_mode == MANUAL ? "MANUAL" : "REQUEST",
                           step, addr, words_to_transfer);
 
-            for (uint32_t i = 0; i < words_to_transfer; ++i) {
+            uint32_t i = 0;
+            for (; i < words_to_transfer; ++i) {
                 uint32_t cur = addr & 0x00FFFFFC;
                 if (cur >= DMA_RAM_LIMIT) {
                     LOG_DMA_ERROR("[DMA] ch%d addr 0x%08x out of RAM", channel_index, cur);
@@ -1171,7 +1374,7 @@ static void interconnect_perform_dma(Interconnect* inter, uint32_t channel_index
                     break;
                 }
                 if (ch->direction == FROM_RAM) {
-                    uint32_t data = interconnect_load32(inter, cur);
+                    uint32_t data = dma_ram_read32(inter, cur);
                     switch (channel_index) {
                         case 4: {
                             uint16_t hw[2] = { (uint16_t)(data & 0xFFFF), (uint16_t)(data >> 16) };
@@ -1203,6 +1406,10 @@ static void interconnect_perform_dma(Interconnect* inter, uint32_t channel_index
                 addr = (uint32_t)((int32_t)addr + step);
             }
             LOG_DMA_DEBUG("[DMA] ch%d transfer complete: %u words", channel_index, words_to_transfer);
+            dma_doc_busy_for(inter, dma_doc_ticks(inter, channel_index, i));
+            moved_words   = i;
+            next_addr     = addr;
+            have_progress = true;
             break;
         }
 
@@ -1225,6 +1432,11 @@ static void interconnect_perform_dma(Interconnect* inter, uint32_t channel_index
         uint32_t stall = words * rate + ((words + 15u) / 16u) * 17u;
         inter->cpu->downcount -= (int32_t)stall;
     }
+
+    /* After the stall above, which reads BCR for its word count. */
+    if (have_progress)
+        dma_writeback(&inter->dma, channel_index, next_addr,
+                      dma_get_transfer_size_words(ch) - moved_words);
 
     // DMA completion IRQ (IRQ3)
     if (inter->dma.channel_irq_enable & (1u << channel_index)) {

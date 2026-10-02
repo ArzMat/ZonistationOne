@@ -154,127 +154,150 @@ static void store_interp(SpuVoice* voice, int fa) {
 }
 
 /* =========================================================================
- * ADPCM block decode — pcsx-redux MainThread decode loop, 1:1
+ * ADPCM block fetch
+ *
+ * One 16-byte block per 28 samples: header byte (shift/filter), flags byte,
+ * then 14 bytes of nibbles (psx-spx spu/soundprocessingunitspu.md:149-174).
+ * The sample decode is the pcsx-redux loop; the address, IRQ and loop handling
+ * around it are written from the documentation:
+ *
+ *  - the IRQ address traps the block being *read*, at the moment it is read
+ *    (:824). This compared against `curr_addr + 16`, the block after the one
+ *    just decoded, so an IRQ address on the first block of a looping buffer
+ *    never fired: the block that precedes it in memory is not part of the
+ *    loop. That is the classic double-buffered SPU stream (:855-866), whose
+ *    refill then never came.
+ *  - Loop Start copies the current address to the repeat address, every time
+ *    (:134-135, :165). A software write to the repeat address used to switch
+ *    this off until the next Key On.
+ *  - Loop End jumps to the repeat address after the block has been played, and
+ *    sets ENDX (:136-138, :163). It used to jump only when this voice had seen
+ *    a Loop Start since Key On, and to stop the voice otherwise, so a ring with
+ *    no Loop Start flag, looped through a repeat address the game wrote before
+ *    Key On, played once and went silent.
+ *  - Code 1 (End without Repeat) still jumps, and also forces Release with the
+ *    envelope at 0 (:164, :171). The voice keeps reading: "There's no way to
+ *    stop the output" (:180).
+ *
+ * `decode` is false for a silent voice: the samples are not needed, only the
+ * position, the flags and the IRQ check are.
  * ========================================================================= */
 
-static void voice_decode_block(Spu* spu, struct Interconnect* inter, SpuVoice* voice) {
-    uint8_t* start = (uint8_t*)spu->ram + voice->curr_addr;
-
-    int predict_nr = (int)*start++;
-    int shift_factor = predict_nr & 0xF;
-    predict_nr >>= 4;
-    int flags = (int)*start++;
-
-    if (predict_nr > 4) predict_nr = 4;
-    if (shift_factor > 12) shift_factor = 9;
-
-    int s_1 = voice->s_1;
-    int s_2 = voice->s_2;
-    unsigned int nSample = 0;
-
-    /* The decoded sample is saturated to 16 bits *before* it becomes filter
-     * state. The SPU's datapath is 16-bit, and the equivalent CD-XA decoder is
-     * explicit about it (`DOCS/cdromformat.md:836-837`, already applied in
-     * `cdrom_audio.c`); the sample is clamped to 16 bits on decode here too.
-     * Feeding the raw prediction back lets one overflowing nibble poison the
-     * remaining 27 samples of the block, and leaves out-of-range values in SB[]
-     * that are only clamped much later, after the envelope and volume have
-     * already scaled them. */
-    for (; nSample < 28; start++) {
-        int d = (int)*start;
-        int s = (d & 0x0F) << 12;
-        if (s & 0x8000) s |= 0xFFFF0000;
-        int fa = (s >> shift_factor) + ((s_1 * adpcm_f[predict_nr][0]) >> 6) + ((s_2 * adpcm_f[predict_nr][1]) >> 6);
-        fa = adpcm_clamp16(fa);
-        s_2 = s_1; s_1 = fa;
-        voice->SB[nSample++] = fa;
-
-        s = (d & 0xF0) << 8;
-        if (s & 0x8000) s |= 0xFFFF0000;
-        fa = (s >> shift_factor) + ((s_1 * adpcm_f[predict_nr][0]) >> 6) + ((s_2 * adpcm_f[predict_nr][1]) >> 6);
-        fa = adpcm_clamp16(fa);
-        s_2 = s_1; s_1 = fa;
-        voice->SB[nSample++] = fa;
-    }
-
-    voice->s_1 = s_1;
-    voice->s_2 = s_2;
-
-    /* IRQ check on decoded block */
-    if (spu->control & SPU_CTRL_IRQ9_ENABLE) {
-        uint32_t block_end = voice->curr_addr + 16;
-        spu_check_irq(spu, inter, block_end);
-    }
-
-    /* Flag 4: set loop point to start of this block */
-    if ((flags & 4) && !voice->ignore_loop) {
-        voice->loop_addr = voice->curr_addr;
-        voice->repeat_address = (uint16_t)(voice->curr_addr >> 3);
-        voice->loop_addr_set = true;
-    }
-
-    /* Advance current address */
-    if (flags & 1) {
-        /* End-of-sample: loop if flags==3 and loop set, else stop */
-        if ((flags & 3) == 3 && voice->loop_addr_set) {
-            voice->curr_addr = voice->loop_addr;
-        } else {
-            voice->curr_addr = 0xFFFFFFFF;  /* one-shot stop sentinel */
+static void voice_fetch_block(Spu* spu, struct Interconnect* inter, SpuVoice* voice, bool decode) {
+    if (voice->blocks_since_kon < 2) voice->blocks_since_kon++;
+    /* Code 1 on the block just played: its Release and zero envelope are due
+     * now that the block is done, on the same "after playing the current ADPCM
+     * block" boundary as the jump itself (:136-138). A silent voice has no
+     * envelope left to force. */
+    if (voice->reach_end) {
+        voice->reach_end = false;
+        if (voice->on) {
+            voice->adsr_state  = ADSR_STATE_RELEASE;
+            voice->stop        = false;
+            voice->EnvelopeVol = 0;
+            voice->adsr_volume = 0;
         }
+    }
+
+    const uint32_t mask = SPU_RAM_SIZE - 1;
+    const uint32_t a = voice->curr_addr & mask;          /* this block */
+    const uint8_t* ram8 = (const uint8_t*)spu->ram;
+
+    spu_check_irq_range(spu, inter, a, ADPCM_BLOCK_SIZE);
+
+    const int flags = (int)ram8[(a + 1) & mask];
+
+    if (decode) {
+        int predict_nr   = (int)ram8[a];
+        int shift_factor = predict_nr & 0xF;
+        predict_nr >>= 4;
+
+        if (predict_nr > 4) predict_nr = 4;
+        if (shift_factor > 12) shift_factor = 9;
+
+        int s_1 = voice->s_1;
+        int s_2 = voice->s_2;
+        unsigned int nSample = 0;
+
+        /* The decoded sample is saturated to 16 bits *before* it becomes filter
+         * state. The SPU's datapath is 16-bit, and the equivalent CD-XA decoder
+         * is explicit about it (`DOCS/cdromformat.md:836-837`, already applied
+         * in `cdrom_audio.c`); the sample is clamped to 16 bits on decode here
+         * too. Feeding the raw prediction back lets one overflowing nibble
+         * poison the remaining 27 samples of the block, and leaves out-of-range
+         * values in SB[] that are only clamped much later, after the envelope
+         * and volume have already scaled them. */
+        for (uint32_t i = 2; nSample < 28; i++) {
+            int d = (int)ram8[(a + i) & mask];
+            int s = (d & 0x0F) << 12;
+            if (s & 0x8000) s |= 0xFFFF0000;
+            int fa = (s >> shift_factor) + ((s_1 * adpcm_f[predict_nr][0]) >> 6) + ((s_2 * adpcm_f[predict_nr][1]) >> 6);
+            fa = adpcm_clamp16(fa);
+            s_2 = s_1; s_1 = fa;
+            voice->SB[nSample++] = fa;
+
+            s = (d & 0xF0) << 8;
+            if (s & 0x8000) s |= 0xFFFF0000;
+            fa = (s >> shift_factor) + ((s_1 * adpcm_f[predict_nr][0]) >> 6) + ((s_2 * adpcm_f[predict_nr][1]) >> 6);
+            fa = adpcm_clamp16(fa);
+            s_2 = s_1; s_1 = fa;
+            voice->SB[nSample++] = fa;
+        }
+
+        voice->s_1 = s_1;
+        voice->s_2 = s_2;
+    }
+
+    /* Loop Start: the repeat address becomes this block (:134-135), unless a
+     * software write has latched it (the LSAX write in spu.c). */
+    if ((flags & 4) && !voice->ignore_loop)
+        voice->repeat_address = (uint16_t)(a >> 3);
+
+    /* Loop End: the next block is the one at the repeat address, read once this
+     * block has played, which is the next fetch (:136-138). Applied after Loop
+     * Start, so a block carrying both repeats itself: the documented silent
+     * dummy loop (:180-182). */
+    if (flags & 1) {
+        voice->curr_addr = ((uint32_t)voice->repeat_address * 8) & mask;
         voice->endx_mask = true;
+        if (!(flags & 2))
+            voice->reach_end = true;     /* Code 1, End+Mute (:171) */
     } else {
-        voice->curr_addr += 16;
+        voice->curr_addr = (a + ADPCM_BLOCK_SIZE) & mask;
         voice->endx_mask = false;
     }
 
     voice->SBPos = 0;
 
-    LOG_SPU_TRACE("[SPU] Voice decode: flags=0x%02X loop=%d endx=%d curr=0x%06X",
-                  flags, voice->loop_addr_set, voice->endx_mask, voice->curr_addr);
+    LOG_SPU_TRACE("[SPU] Voice block 0x%05X flags=0x%02X next=0x%05X lsa=0x%04X",
+                  a, flags, voice->curr_addr, voice->repeat_address);
 }
 
-/* =========================================================================
- * Main voice sample generator — pcsx-redux MainThread inner loop, 1:1
- * Returns ADSR-mixed sample (before L/R volume).  Caller accumulates.
- * ========================================================================= */
-
-int32_t spu_voice_get_sample(Spu* spu, struct Interconnect* inter, int voice_idx) {
-    SpuVoice* voice = &spu->voices[voice_idx];
-
-    if (!voice->on) {
-        voice->sval = 0;
-        return 0;
-    }
-
-    /* Key-off: transition ADSR to Release phase */
-    if (voice->stop) {
-        voice->adsr_state = ADSR_STATE_RELEASE;
-        voice->stop = false;
-    }
-
-    /* Pitch counter step — DOCS/soundprocessingunitspu.md:187-199, transcribed in
-     * the documentation's own units (one sample = 1000h) and shifted at the end,
-     * because this file's spos counter runs at 16x that (one sample = 10000h).
-     *
-     *   Step = VxPitch                  ;range +0000h..+FFFFh
-     *   IF PMON.Bit(x)=1 AND (x>0)
-     *     Factor = VxOUTX(x-1)          ;range -8000h..+7FFFh
-     *     Factor = Factor+8000h         ;range +0000h..+FFFFh
-     *     Step = SignExpand16to32(Step) ;hardware glitch on VxPitch>7FFFh
-     *     Step = (Step * Factor) SAR 15
-     *     Step = Step AND 0000FFFFh     ;hardware glitch on VxPitch>7FFFh
-     *   IF Step>3FFFh then Step=4000h   ;range +0000h..+3FFFh (0..176.4 kHz)
-     *
-     * The last line is the one that matters here, and it sits *outside* the
-     * modulation branch: every voice is capped at 4000h, modulated or not. This
-     * code only capped modulated voices, so an unmodulated voice could step at up
-     * to FFFFh — 705.6 kHz against the 176.4 kHz the hardware allows, four times
-     * too fast. Playing sample data at four times its rate through a 4-point
-     * interpolator with no low-pass aliases straight to the top of the band, which
-     * is audible as short bursts of buzz rather than as a wrong note.
-     *
-     * Note the cap sets 4000h; it does not clamp to 3FFFh. The two differ by one
-     * step and the documentation is explicit about which it is. */
+/* Pitch counter step for one output sample, DOCS/soundprocessingunitspu.md:
+ * 187-199, transcribed in the documentation's own units (one sample = 1000h);
+ * the caller shifts it, because this file's spos counter runs at 16x that (one
+ * sample = 10000h).
+ *
+ *   Step = VxPitch                  ;range +0000h..+FFFFh
+ *   IF PMON.Bit(x)=1 AND (x>0)
+ *     Factor = VxOUTX(x-1)          ;range -8000h..+7FFFh
+ *     Factor = Factor+8000h         ;range +0000h..+FFFFh
+ *     Step = SignExpand16to32(Step) ;hardware glitch on VxPitch>7FFFh
+ *     Step = (Step * Factor) SAR 15
+ *     Step = Step AND 0000FFFFh     ;hardware glitch on VxPitch>7FFFh
+ *   IF Step>3FFFh then Step=4000h   ;range +0000h..+3FFFh (0..176.4 kHz)
+ *
+ * The last line is the one that matters here, and it sits *outside* the
+ * modulation branch: every voice is capped at 4000h, modulated or not. This
+ * code only capped modulated voices, so an unmodulated voice could step at up
+ * to FFFFh, 705.6 kHz against the 176.4 kHz the hardware allows, four times
+ * too fast. Playing sample data at four times its rate through a 4-point
+ * interpolator with no low-pass aliases straight to the top of the band, which
+ * is audible as short bursts of buzz rather than as a wrong note.
+ *
+ * Note the cap sets 4000h; it does not clamp to 3FFFh. The two differ by one
+ * step and the documentation is explicit about which it is. */
+static inline int32_t voice_pitch_step(const Spu* spu, const SpuVoice* voice, int voice_idx) {
     int32_t step = (int32_t)voice->pitch;                  /* 0000h..FFFFh */
 
     if (voice_idx > 0 && ((spu->pitch_mod >> voice_idx) & 1)) {
@@ -285,22 +308,65 @@ int32_t spu_voice_get_sample(Spu* spu, struct Interconnect* inter, int voice_idx
     }
 
     if (step > 0x3FFF) step = 0x4000;
+    return step;
+}
 
-    int sinc = step << 4;
+/* A voice whose envelope has finished, that was keyed off, or that ended on a
+ * Code 1 block is silent, but it is still reading SPU RAM: "all voices are
+ * permanently reading data from SPU RAM - even in Noise mode, even if the Voice
+ * Volume is zero, and even if the ADSR pattern has finished the Release period
+ * - so even inaudible voices can trigger IRQs" (soundprocessingunitspu.md:
+ * 825-829). Such a voice used to freeze where it stopped, so an IRQ a game
+ * timed off a muted voice never came.
+ *
+ * Only the position moves here (pitch counter, block flags, loops, ENDX and the
+ * IRQ check); nothing is decoded, interpolated or mixed, so a silent voice
+ * costs an add and a compare per sample and one header read per 28 samples.
+ * Key On re-initialises everything this leaves stale (decoder history, Gauss
+ * ring). */
+static void voice_advance_silent(Spu* spu, struct Interconnect* inter, SpuVoice* voice, int voice_idx) {
+    int32_t step = voice_pitch_step(spu, voice, voice_idx);
+    while (voice->spos >= 0x10000) {
+        if (voice->SBPos >= 28) voice_fetch_block(spu, inter, voice, false);
+        voice->SBPos++;
+        voice->spos -= 0x10000;
+    }
+    voice->spos += step << 4;
+
+    if (voice->endx_mask) {
+        spu->endx |= (1u << voice_idx);
+        voice->endx_mask = false;
+    }
+}
+
+/* =========================================================================
+ * Main voice sample generator, after the pcsx-redux MainThread inner loop.
+ * Returns ADSR-mixed sample (before L/R volume).  Caller accumulates.
+ * ========================================================================= */
+
+int32_t spu_voice_get_sample(Spu* spu, struct Interconnect* inter, int voice_idx) {
+    SpuVoice* voice = &spu->voices[voice_idx];
+
+    if (!voice->on) {
+        voice->sval = 0;
+        /* With SPUCNT.15 = 0 the SPU is off (soundprocessingunitspu.md:630) and
+         * spu_set_control has forced every voice off; nothing reads RAM then. */
+        if (spu->control & SPU_CTRL_ENABLE)
+            voice_advance_silent(spu, inter, voice, voice_idx);
+        return 0;
+    }
+
+    /* Key-off: transition ADSR to Release phase */
+    if (voice->stop) {
+        voice->adsr_state = ADSR_STATE_RELEASE;
+        voice->stop = false;
+    }
+
+    int sinc = voice_pitch_step(spu, voice, voice_idx) << 4;
 
     /* Advance spos: decode samples into gauss ring until spos < 0x10000 */
     while (voice->spos >= 0x10000) {
-        if (voice->SBPos == 28) {
-            if (voice->curr_addr == 0xFFFFFFFF) {
-                /* One-shot end: silence voice */
-                voice->on = false;
-                voice->EnvelopeVol = 0;
-                voice->adsr_volume = 0;
-                voice->sval = 0;
-                return 0;
-            }
-            voice_decode_block(spu, inter, voice);
-        }
+        if (voice->SBPos >= 28) voice_fetch_block(spu, inter, voice, true);
 
         int fa = voice->SB[voice->SBPos++];
         store_interp(voice, fa);
@@ -315,13 +381,13 @@ int32_t spu_voice_get_sample(Spu* spu, struct Interconnect* inter, int voice_idx
         fa = voice_interpolate(voice);
     }
 
-    /* ADSR envelope mix — returns 0-32767 (15-bit) */
+    /* ADSR envelope mix: returns 0-32767 (15-bit) */
     int32_t adsr_vol = spu_adsr_mix(voice);
     int32_t mixed = ((int32_t)fa * adsr_vol) >> 15;
 
     /* VxOUTX is a 16-bit signed value: "Factor = VxOUTX(x-1) ;range -8000h..+7FFFh
-     * (prev voice amplitude)" — DOCS/soundprocessingunitspu.md:192. This clamped to
-     * ±FFFFh, twice the range the register can hold, which let a voice put double
+     * (prev voice amplitude)", DOCS/soundprocessingunitspu.md:192. This clamped to
+     * +/-FFFFh, twice the range the register can hold, which let a voice put double
      * its legal excursion into the dry mix and doubled the swing of the pitch
      * modulation factor a following voice reads out of it. */
     if (mixed >  32767) mixed =  32767;
@@ -342,53 +408,91 @@ int32_t spu_voice_get_sample(Spu* spu, struct Interconnect* inter, int voice_idx
 }
 
 /* =========================================================================
- * Volume sweep tick — called once per sample per voice from spu_mixing.c
- * Implements PSX-SPX "Sweep Volume Control" algorithm.
- * Only runs when bit15 of the volume register is set (sweep mode).
+ * Sweep volume: psx-spx spu/soundprocessingunitspu.md:405-435 (register
+ * format) and :447-482 (the envelope operation it runs, once per 44.1 kHz
+ * clock). Transcribed from the pseudo-code:
+ *
+ *   AdsrStep = 7 - StepValue
+ *   IF Decreasing XOR PhaseNegative THEN AdsrStep = NOT AdsrStep
+ *   AdsrStep = AdsrStep SHL Max(0,11-ShiftValue)
+ *   CounterIncrement = 8000h SHR Max(0,ShiftValue-11)
+ *   IF exponential AND increase AND AdsrLevel>6000h THEN
+ *     IF ShiftValue < 10 THEN AdsrStep /= 4
+ *     ELSE IF ShiftValue >= 11 THEN CounterIncrement /= 4
+ *     ELSE AdsrStep /= 2, CounterIncrement /= 2
+ *   ELSE IF exponential AND decrease THEN AdsrStep=AdsrStep*AdsrLevel/8000h
+ *   IF (StepValue | (ShiftValue SHL 2)) != ALL_BITS THEN
+ *     CounterIncrement = MAX(CounterIncrement, 1)
+ *   Counter += CounterIncrement
+ *   IF (Counter & 8000h) == 0 THEN RETURN
+ *   AdsrLevel = AdsrLevel + AdsrStep
+ *   IF NOT decreasing THEN AdsrLevel = CLAMP(AdsrLevel, -8000h..+7FFFh)
+ *   ELSE IF PhaseNegative THEN AdsrLevel = CLAMP(AdsrLevel, -8000h..0h)
+ *   ELSE AdsrLevel = MAX(AdsrLevel, 0)
+ *
+ * What it changes against the code it replaces:
+ *  - a linear decrease stops at 0 (:431-432, :480-481). It used to run on to
+ *    -8000h, so a fade-out went through silence and came back at full volume
+ *    with the phase inverted: the previous scene's sound "returning";
+ *  - the phase bit (:419, :433-435, :498-503) inverts the step and picks the
+ *    clamp. It was ignored;
+ *  - an exponential increase above 6000h is a slower *linear* step (:455-462,
+ *    :484-485), not a step proportional to the level;
+ *  - all-ones step and shift never step (:466-467, :490-491).
+ *
+ * Two points the pseudo-code leaves implicit:
+ *  - the counter is cleared when it steps. That is what makes a step every
+ *    `1 SHL Max(0,ShiftValue-11)` cycles, the older formula the text says is
+ *    right up to shift 26 (:493-496), and what the code here always did;
+ *  - "/8000h" in the exponential decrease is taken as SAR 15, as in the ADSR
+ *    envelope (spu_adsr.c), so a decaying level reaches 0 instead of stalling
+ *    one step above it.
  * ========================================================================= */
+int spu_sweep_tick(uint16_t reg, int level, int32_t* counter) {
+    const int  shift      = (reg >> 2) & 0x1F;
+    const int  step_value = reg & 0x03;
+    const bool exp_mode   = (reg & 0x4000) != 0;
+    const bool decreasing = (reg & 0x2000) != 0;
+    const bool phase_neg  = (reg & 0x1000) != 0;
+
+    int32_t step = 7 - step_value;
+    if (decreasing != phase_neg) step = ~step;           /* +7..+4 -> -8..-5 */
+    if (shift < 11) step *= (int32_t)1 << (11 - shift);
+    int32_t inc = 0x8000 >> (shift > 11 ? shift - 11 : 0);
+
+    if (exp_mode && !decreasing && level > 0x6000) {
+        if (shift < 10)       step >>= 2;
+        else if (shift >= 11) inc  >>= 2;
+        else                { step >>= 1; inc >>= 1; }
+    } else if (exp_mode && decreasing) {
+        step = (step * (int32_t)level) >> 15;
+    }
+    if ((step_value | (shift << 2)) != 0x7F && inc < 1) inc = 1;
+
+    *counter += inc;
+    if (!(*counter & 0x8000)) return level;
+    *counter = 0;
+
+    int32_t v = (int32_t)level + step;
+    if (!decreasing) {
+        if (v >  0x7FFF) v =  0x7FFF;
+        if (v < -0x8000) v = -0x8000;
+    } else if (phase_neg) {
+        if (v > 0)       v = 0;
+        if (v < -0x8000) v = -0x8000;
+    } else if (v < 0) {
+        v = 0;
+    }
+    return (int)v;
+}
+
+/* Called once per sample per voice from spu_mixing.c. Only a register in sweep
+ * mode (bit15=1) moves the level; fixed mode set it when it was written. */
 void spu_voice_sweep_tick(SpuVoice* voice) {
-    /* Left channel — sweep mode (bit15=1).
-     * PSX-SPX (DOCS/soundprocessingunitspu.md:366-387): bit14=Exp(0=lin,1=exp),
-     * bit13=Direction(0=inc,1=dec), bit12=Phase, bits6-2=Shift, bits1-0=Step.
-     * Bit 7 is documented as unused; reading the direction from it made every
-     * sweep run the wrong way. */
-    if (voice->volume_left & 0x8000) {
-        uint16_t reg = voice->volume_left;
-        int shift     = (reg >> 2) & 0x1F;
-        int step_idx  = reg & 0x03;
-        int decrease  = (reg >> 13) & 1;
-        int exp_mode  = (reg >> 14) & 1;
-        int threshold = (shift >= 11) ? (1 << (shift - 11)) : 1;
-        if (++voice->vol_left_count >= threshold) {
-            voice->vol_left_count = 0;
-            int step = decrease ? (-8 + step_idx) : (7 - step_idx);
-            if (shift < 11) step <<= (11 - shift);
-            int32_t v;
-            if (exp_mode && (decrease || voice->vol_left >= 0x6000))
-                v = voice->vol_left + ((step * voice->vol_left) >> 15);
-            else
-                v = voice->vol_left + step;
-            voice->vol_left = (v > 0x7FFF) ? 0x7FFF : (v < -0x8000) ? -0x8000 : (int)v;
-        }
-    }
-    /* Right channel */
-    if (voice->volume_right & 0x8000) {
-        uint16_t reg = voice->volume_right;
-        int shift     = (reg >> 2) & 0x1F;
-        int step_idx  = reg & 0x03;
-        int decrease  = (reg >> 13) & 1;
-        int exp_mode  = (reg >> 14) & 1;
-        int threshold = (shift >= 11) ? (1 << (shift - 11)) : 1;
-        if (++voice->vol_right_count >= threshold) {
-            voice->vol_right_count = 0;
-            int step = decrease ? (-8 + step_idx) : (7 - step_idx);
-            if (shift < 11) step <<= (11 - shift);
-            int32_t v;
-            if (exp_mode && (decrease || voice->vol_right >= 0x6000))
-                v = voice->vol_right + ((step * voice->vol_right) >> 15);
-            else
-                v = voice->vol_right + step;
-            voice->vol_right = (v > 0x7FFF) ? 0x7FFF : (v < -0x8000) ? -0x8000 : (int)v;
-        }
-    }
+    if (voice->volume_left & 0x8000)
+        voice->vol_left = spu_sweep_tick(voice->volume_left, voice->vol_left,
+                                         &voice->vol_left_count);
+    if (voice->volume_right & 0x8000)
+        voice->vol_right = spu_sweep_tick(voice->volume_right, voice->vol_right,
+                                          &voice->vol_right_count);
 }

@@ -64,7 +64,9 @@ emu.on_event(function(name)
   if frames % REPORT_EVERY ~= 0 then return end
 
   local gen, dropped, used, size, keys = emu.spu_stats()
-  local _, _, cd_drop = emu.cd_audio()
+  -- Fourth value: total_dropped. The third is total_popped, which this used to
+  -- report as the XA drop count.
+  local _, _, _, cd_drop = emu.cd_audio()
   local _, _, _, _, _, ring_drop, under_ev = emu.audio_stats()
 
   -- gen is the sample index into the ZS1_AUDIO_DUMP file: the dump is written

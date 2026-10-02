@@ -70,6 +70,11 @@ typedef struct {
     bool     greyscale;
     bool     show_alpha;      /* render the mask bit (bit 15) as intensity */
     uint16_t clut_x, clut_y;  /* CLUT position for the indexed modes */
+    /* The viewer is on screen this frame. Set by debug_ui.cpp every frame; a
+     * backend skips its decode pass (a 1024x512 fullscreen draw) when false,
+     * which is every frame of the gameplay shell. Zero-initialised: off until
+     * the viewer is first drawn. */
+    bool     enabled;
 } VramViewParams;
 
 typedef enum {

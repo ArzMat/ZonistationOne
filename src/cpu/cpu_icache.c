@@ -6,6 +6,7 @@
  * components of this project that have other authors.
  */
 #include "cpu.h"
+#include "cpu_mem.h"
 #include "interconnect.h"
 
 // --- Instruction Cache ---
@@ -87,8 +88,9 @@ uint32_t cpu_icache_fetch(Cpu* cpu, uint32_t vaddr, bool count_cycles) {
 
 
     // --- Address Calculation ---
-    // The cache uses physical addresses for tags and indexing.
-    uint32_t paddr = mask_region(vaddr);
+    // The cache uses physical addresses for tags and indexing. The inline copy
+    // of mask_region (cpu_mem.h): this runs once per instruction.
+    uint32_t paddr = bus_mask_region(vaddr);
 
     // Extract cache components from physical address (based on 4KB, 4-word lines)
     // Tag:          Bits [31:12] of paddr

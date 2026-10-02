@@ -191,6 +191,12 @@ const uint16_t* glr_get_vram_readback(uint32_t* seq_out) {
  * the ops are not replayed when the full frame is submitted — replaying a
  * semi-transparent draw would blend it twice. */
 static uint32_t     s_exec_from[2];       /* first unexecuted op, per slot */
+/* How many of each slot's vertices are already in the four VBOs. A slot's
+ * vertex arrays are uploaded once per replay, from here to s_vtx[slot], instead
+ * of once per batch; incremental because a synchronous readback replays the
+ * write slot part-way through the frame and the rest follows at submit. Reset
+ * with the slot. GPU thread only. */
+static uint32_t     s_vtx_uploaded[2];
 static SDL_Condition*    s_sync_rb_done;
 static SDL_AtomicInt s_sync_rb_pending;    /* CPU sets 1; GPU clears when done */
 static int          s_sync_rb_slot;
@@ -1202,6 +1208,15 @@ void glr_set_texture_window(GlRenderer* renderer, uint8_t mask_x, uint8_t mask_y
     uint32_t or_x = (offset_x & mask_x) * 8u;
     uint32_t or_y = (offset_y & mask_y) * 8u;
 
+    /* Compare before flushing, like the mode setters: gpu_commands.c re-sends
+     * E2 whenever the game does, and an unchanged value used to split the
+     * batch anyway. */
+    if (renderer->cached_tex_window[0] == (int32_t)and_x &&
+        renderer->cached_tex_window[1] == (int32_t)and_y &&
+        renderer->cached_tex_window[2] == (int32_t)or_x &&
+        renderer->cached_tex_window[3] == (int32_t)or_y)
+        return;
+
     glr_draw(renderer);
     /* Cache tex window — applied per-batch in glr_draw_gl() on GPU thread */
     renderer->cached_tex_window[0] = (int32_t)and_x;
@@ -1344,111 +1359,183 @@ static void apply_semi_trans_blend(uint8_t mode) {
 }
 
 /* -------------------------------------------------------------------------
- * glr_draw_gl — INTERNAL: called by GPU thread to execute one batch.
- * All GL calls are here; CPU thread never calls this directly.
+ * Replay state, GPU thread only.
+ *
+ * One of these lives for the length of one replay (a frame, or the part of
+ * the write slot a synchronous readback runs). It exists so a batch issues
+ * only the GL calls that differ from the batch before it. The old per-batch
+ * cost was about 25 calls: ten uniforms, scissor, program, VAO and texture
+ * binds and unbinds, a glTextureBarrier, and four glBufferSubData at offset 0
+ * that rewrote the start of the same four buffers the previous draw was still
+ * reading, which a driver can only honour by stalling or by copying.
+ *
+ * Everything starts "unknown" at the top of a replay, because other code on
+ * this context (ImGui, scanout, the viewer pass, VRAM updates) changes the
+ * same bindings and blend state between replays.
  * ------------------------------------------------------------------------- */
-static void glr_draw_gl(GlRenderer* renderer, const GpuBatch* b, int slot) {
+typedef struct {
+    bool    bound;          /* program, VAO and the VRAM texture are bound */
+    bool    written;        /* vram_tex may hold rendered pixels that no barrier
+                             * has made visible to texel fetches yet */
+    int     blend_on;       /* -1 unknown, 0 off, 1 on */
+    int     blend_mode;     /* semi-transparency mode last applied, -1 unknown */
+    bool    uni_valid;      /* the cached uniforms below are what the program holds */
+    int     stp_mode;
+    int16_t offset_x, offset_y;
+    float   screen_w, screen_h;
+    int32_t tex_window[4];
+    int     dither, set_mask, mask_test, use_texture, raw_texture;
+    bool    scissor_valid;
+    int32_t scissor[4];
+} GlrReplay;
+
+static void glr_replay_begin(GlrReplay* ctx) {
+    memset(ctx, 0, sizeof(*ctx));
+    ctx->bound      = false;
+    /* Conservative: whatever the previous replay drew has not been behind a
+     * barrier as far as this one can tell, so the first batch that samples
+     * VRAM gets one. */
+    ctx->written    = true;
+    ctx->blend_on   = -1;
+    ctx->blend_mode = -1;
+    ctx->uni_valid  = false;
+    ctx->scissor_valid = false;
+}
+
+static void glr_replay_set_blend(GlrReplay* ctx, bool on, int mode) {
+    if (ctx->blend_on != (on ? 1 : 0)) {
+        if (on) glEnable(GL_BLEND); else glDisable(GL_BLEND);
+        ctx->blend_on = on ? 1 : 0;
+    }
+    /* apply_semi_trans_blend() sets the equation, the function and (for modes
+     * 0 and 3) the constant every time, so one mode value fully describes it. */
+    if (on && ctx->blend_mode != mode) {
+        apply_semi_trans_blend((uint8_t)mode);
+        ctx->blend_mode = mode;
+    }
+}
+
+static void glr_replay_set_stp(GlRenderer* renderer, GlrReplay* ctx, int stp) {
+    if (renderer->uniform_stp_mode_loc < 0) return;
+    if (ctx->uni_valid && ctx->stp_mode == stp) return;
+    glUniform1i(renderer->uniform_stp_mode_loc, stp);
+    ctx->stp_mode = stp;
+}
+
+/* -------------------------------------------------------------------------
+ * glr_draw_gl — INTERNAL: called by GPU thread to execute one batch.
+ * All GL calls are here; CPU thread never calls this directly. The slot's
+ * vertices are already in the VBOs at their own indices (glr_replay_slot), so
+ * the draw starts at b->vertex_start.
+ * ------------------------------------------------------------------------- */
+static void glr_draw_gl(GlRenderer* renderer, const GpuBatch* b, GlrReplay* ctx) {
     if (b->vertex_count == 0) return;
 
-    glDisable(GL_BLEND);  /* each batch starts with blend off; two-pass re-enables for STP pass */
-    glUseProgram(renderer->shader_program);
-
-    /* Apply cached state from batch snapshot */
-    glUniform2i(renderer->uniform_offset_loc, b->offset_x, b->offset_y);
-    if (renderer->uniform_screen_scale_loc >= 0)
-        glUniform2f(renderer->uniform_screen_scale_loc,
-                    b->screen_w * 0.5f, b->screen_h * 0.5f);
-    if (renderer->uniform_tex_window_loc >= 0)
-        glUniform4i(renderer->uniform_tex_window_loc,
-                    b->tex_window[0], b->tex_window[1],
-                    b->tex_window[2], b->tex_window[3]);
-    if (renderer->uniform_dither_loc >= 0)
-        glUniform1i(renderer->uniform_dither_loc, b->dither_enabled ? 1 : 0);
-    if (renderer->uniform_set_mask_loc >= 0)
-        glUniform1i(renderer->uniform_set_mask_loc, b->set_mask_enabled ? 1 : 0);
-    if (renderer->uniform_mask_test_loc >= 0)
-        glUniform1i(renderer->uniform_mask_test_loc, b->mask_test_enabled ? 1 : 0);
-    glUniform1i(renderer->uniform_use_texture_loc, b->texture_enabled ? 1 : 0);
-    if (renderer->uniform_raw_texture_loc >= 0)
-        glUniform1i(renderer->uniform_raw_texture_loc, b->raw_texture_enabled ? 1 : 0);
-    glUniform1i(renderer->uniform_vram_texture_loc, 0);
-
-    /* Scissor */
-    glEnable(GL_SCISSOR_TEST);
-    glScissor(b->scissor[0], b->scissor[1], b->scissor[2], b->scissor[3]);
-
-    /* Bind whichever VRAM the shader was built to read, and make the pixels the
-     * previous batch drew visible to this one.
-     *
-     * With the barrier the sampled texture *is* the render target, so every draw
-     * that reads it has to be separated from the draws that wrote it. One barrier
-     * per batch is the coarse but correct placement: batches are already the unit
-     * at which state changes are flushed, and a game that draws into VRAM and
-     * samples it back does so across batches, never inside one.
-     *
-     * The mask test reads the destination too, so it needs the same separation
-     * even when the batch is untextured — hence the barrier is not conditional on
-     * texture_enabled the way the bind is. */
-    if (s_texture_barrier) {
-        glTextureBarrier();
-        /* Bound unconditionally: an untextured batch still samples through this
-         * unit when the mask test is on. */
+    if (!ctx->bound) {
+        glUseProgram(renderer->shader_program);
+        glBindVertexArray(renderer->vao);
+        /* Bind whichever VRAM the shader was built to read. With the barrier the
+         * sampled texture *is* the render target; bound for every batch, since
+         * an untextured batch still samples through this unit when the mask
+         * test is on. Without it, the R16UI mirror; an untextured batch does
+         * not sample (use_texture is 0 and the mask test is compiled out), so
+         * leaving it bound for those is harmless. */
         glActiveTexture(GL_TEXTURE0);
-        glBindTexture(GL_TEXTURE_2D, renderer->vram_tex);
-    } else if (b->texture_enabled) {
-        glActiveTexture(GL_TEXTURE0);
-        glBindTexture(GL_TEXTURE_2D, renderer->vram_texture);
+        glBindTexture(GL_TEXTURE_2D, s_texture_barrier ? renderer->vram_tex : renderer->vram_texture);
+        glEnable(GL_SCISSOR_TEST);
+        ctx->bound = true;
     }
 
-    glBindVertexArray(renderer->vao);
+    /* Make pixels drawn by earlier batches visible to this one, when this one
+     * reads VRAM and something has been drawn since the last barrier.
+     *
+     * With the barrier the sampled texture is the render target, a feedback
+     * loop that is defined only with glTextureBarrier() between the draw that
+     * writes and the draw that reads. The batches that read are the textured
+     * ones and the ones with the mask test on (it reads the destination); a
+     * batch that only writes needs nothing, since writes and blending are
+     * ordered by the pipeline. One barrier before the first reading batch after
+     * any write is exactly the guarantee the old one-per-batch barrier gave,
+     * without paying for it on every untextured flat polygon. VRAM update ops
+     * count as writes (glr_replay_slot), conservatively. */
+    if (s_texture_barrier && (b->texture_enabled || b->mask_test_enabled) && ctx->written) {
+        glTextureBarrier();
+        ctx->written = false;
+    }
 
-    /* Upload vertex data from pool */
-    uint32_t vs = b->vertex_start;
-    uint32_t vc = b->vertex_count;
-    glBindBuffer(GL_ARRAY_BUFFER, renderer->position_buffer);
-    glBufferSubData(GL_ARRAY_BUFFER, 0, vc * sizeof(RendererPosition), &s_pos[slot][vs]);
-    glBindBuffer(GL_ARRAY_BUFFER, renderer->color_buffer);
-    glBufferSubData(GL_ARRAY_BUFFER, 0, vc * sizeof(RendererColor),    &s_col[slot][vs]);
-    glBindBuffer(GL_ARRAY_BUFFER, renderer->texcoord_buffer);
-    glBufferSubData(GL_ARRAY_BUFFER, 0, vc * sizeof(RendererTexCoord), &s_tex[slot][vs]);
-    glBindBuffer(GL_ARRAY_BUFFER, renderer->tpage_buffer);
-    glBufferSubData(GL_ARRAY_BUFFER, 0, vc * sizeof(RendererTPage),    &s_tpg[slot][vs]);
-    glBindBuffer(GL_ARRAY_BUFFER, 0);
+    /* Uniforms: only the ones that changed since the previous batch. */
+    if (!ctx->uni_valid || ctx->offset_x != b->offset_x || ctx->offset_y != b->offset_y) {
+        glUniform2i(renderer->uniform_offset_loc, b->offset_x, b->offset_y);
+        ctx->offset_x = b->offset_x; ctx->offset_y = b->offset_y;
+    }
+    if (renderer->uniform_screen_scale_loc >= 0 &&
+        (!ctx->uni_valid || ctx->screen_w != b->screen_w || ctx->screen_h != b->screen_h)) {
+        glUniform2f(renderer->uniform_screen_scale_loc, b->screen_w * 0.5f, b->screen_h * 0.5f);
+        ctx->screen_w = b->screen_w; ctx->screen_h = b->screen_h;
+    }
+    if (renderer->uniform_tex_window_loc >= 0 &&
+        (!ctx->uni_valid || memcmp(ctx->tex_window, b->tex_window, sizeof(ctx->tex_window)) != 0)) {
+        glUniform4i(renderer->uniform_tex_window_loc,
+                    b->tex_window[0], b->tex_window[1], b->tex_window[2], b->tex_window[3]);
+        memcpy(ctx->tex_window, b->tex_window, sizeof(ctx->tex_window));
+    }
+    const int dither = b->dither_enabled ? 1 : 0, set_mask = b->set_mask_enabled ? 1 : 0;
+    const int mask_test = b->mask_test_enabled ? 1 : 0, use_tex = b->texture_enabled ? 1 : 0;
+    const int raw = b->raw_texture_enabled ? 1 : 0;
+    if (renderer->uniform_dither_loc >= 0 && (!ctx->uni_valid || ctx->dither != dither))
+        glUniform1i(renderer->uniform_dither_loc, dither);
+    if (renderer->uniform_set_mask_loc >= 0 && (!ctx->uni_valid || ctx->set_mask != set_mask))
+        glUniform1i(renderer->uniform_set_mask_loc, set_mask);
+    if (renderer->uniform_mask_test_loc >= 0 && (!ctx->uni_valid || ctx->mask_test != mask_test))
+        glUniform1i(renderer->uniform_mask_test_loc, mask_test);
+    if (!ctx->uni_valid || ctx->use_texture != use_tex)
+        glUniform1i(renderer->uniform_use_texture_loc, use_tex);
+    if (renderer->uniform_raw_texture_loc >= 0 && (!ctx->uni_valid || ctx->raw_texture != raw))
+        glUniform1i(renderer->uniform_raw_texture_loc, raw);
+    if (!ctx->uni_valid)
+        glUniform1i(renderer->uniform_vram_texture_loc, 0);
+    ctx->dither = dither; ctx->set_mask = set_mask; ctx->mask_test = mask_test;
+    ctx->use_texture = use_tex; ctx->raw_texture = raw;
+    if (!ctx->uni_valid) {
+        /* u_stp_mode is not set yet in this replay: force the first set below. */
+        ctx->stp_mode = 0x7FFFFFFF;
+        ctx->uni_valid = true;
+    }
 
-    GLenum prim = b->is_lines ? GL_LINES : GL_TRIANGLES;
+    if (!ctx->scissor_valid || memcmp(ctx->scissor, b->scissor, sizeof(ctx->scissor)) != 0) {
+        glScissor(b->scissor[0], b->scissor[1], b->scissor[2], b->scissor[3]);
+        memcpy(ctx->scissor, b->scissor, sizeof(ctx->scissor));
+        ctx->scissor_valid = true;
+    }
+
+    const GLenum  prim  = b->is_lines ? GL_LINES : GL_TRIANGLES;
+    const GLint   first = (GLint)b->vertex_start;
+    const GLsizei count = (GLsizei)b->vertex_count;
 
     if (!b->is_lines && b->semi_trans_enabled && b->texture_enabled) {
-        glDisable(GL_BLEND);
-        if (renderer->uniform_stp_mode_loc >= 0)
-            glUniform1i(renderer->uniform_stp_mode_loc, 0);
-        glDrawArrays(prim, 0, vc);
+        /* Two passes: blending is per draw but the STP bit is per texel, so the
+         * opaque texels go down with blending off and the rest with it on. */
+        glr_replay_set_blend(ctx, false, -1);
+        glr_replay_set_stp(renderer, ctx, 0);
+        glDrawArrays(prim, first, count);
 
-        glEnable(GL_BLEND);
-        apply_semi_trans_blend(b->semi_trans_mode);
-        if (renderer->uniform_stp_mode_loc >= 0)
-            glUniform1i(renderer->uniform_stp_mode_loc, 1);
-        glDrawArrays(prim, 0, vc);
-        if (renderer->uniform_stp_mode_loc >= 0)
-            glUniform1i(renderer->uniform_stp_mode_loc, -1);
+        glr_replay_set_blend(ctx, true, b->semi_trans_mode);
+        glr_replay_set_stp(renderer, ctx, 1);
+        glDrawArrays(prim, first, count);
     } else if (!b->is_lines && b->semi_trans_enabled) {
         /* Flat/gouraud-shaded semi-transparent primitive: no per-texel STP bit
-           to discard on (that only exists for textured sources) — the whole
+           to discard on (that only exists for textured sources): the whole
            primitive is uniformly semi-transparent, so a single blended pass
            is correct, unlike the textured two-pass case above. */
-        if (renderer->uniform_stp_mode_loc >= 0)
-            glUniform1i(renderer->uniform_stp_mode_loc, -1);
-        glEnable(GL_BLEND);
-        apply_semi_trans_blend(b->semi_trans_mode);
-        glDrawArrays(prim, 0, vc);
+        glr_replay_set_stp(renderer, ctx, -1);
+        glr_replay_set_blend(ctx, true, b->semi_trans_mode);
+        glDrawArrays(prim, first, count);
     } else {
-        if (renderer->uniform_stp_mode_loc >= 0)
-            glUniform1i(renderer->uniform_stp_mode_loc, -1);
-        glDrawArrays(prim, 0, vc);
+        glr_replay_set_stp(renderer, ctx, -1);
+        glr_replay_set_blend(ctx, false, -1);
+        glDrawArrays(prim, first, count);
     }
-
-    glBindVertexArray(0);
-    glUseProgram(0);
-    glBindTexture(GL_TEXTURE_2D, 0);
+    ctx->written = true;
 }
 
 /* -------------------------------------------------------------------------
@@ -1628,7 +1715,9 @@ void glr_display(GlRenderer* renderer) {
 // Based on Guide Section 5.10
 void glr_set_draw_offset(GlRenderer* renderer, int16_t x, int16_t y) {
     if (!renderer->initialized) return;
-    LOG_RENDERER_DEBUG("[RENDERER] draw offset (%d, %d) — flushing batch", x, y);
+    /* Unchanged (games re-send E5 with every primitive list): no flush. */
+    if (renderer->cached_offset_x == x && renderer->cached_offset_y == y) return;
+    LOG_RENDERER_DEBUG("[RENDERER] draw offset (%d, %d), flushing batch", x, y);
     glr_draw(renderer);
     renderer->cached_offset_x = x;
     renderer->cached_offset_y = y;
@@ -1642,7 +1731,6 @@ void glr_set_drawing_area(GlRenderer* renderer, uint16_t left, uint16_t top,
                                 uint16_t right, uint16_t bottom)
 {
     if (!renderer->initialized) return;
-    glr_draw(renderer);
 
     float sw = renderer->screen_width  ? renderer->screen_width  : 1024.0f;
     float sh = renderer->screen_height ? renderer->screen_height : 512.0f;
@@ -1662,6 +1750,13 @@ void glr_set_drawing_area(GlRenderer* renderer, uint16_t left, uint16_t top,
      * PSX top edge is the low row — no 512-gl_bot inversion. */
     int gl_y = gl_top;
     if (gl_y < 0) gl_y = 0;
+
+    /* The scissor is computed first and compared, so an E3/E4 pair that names
+     * the area already in force does not split the batch. */
+    if (renderer->cached_scissor[0] == gl_left && renderer->cached_scissor[1] == gl_y &&
+        renderer->cached_scissor[2] == clip_w  && renderer->cached_scissor[3] == clip_h)
+        return;
+    glr_draw(renderer);
 
     /* Cache scissor — applied per-batch on GPU thread */
     renderer->cached_scissor[0] = gl_left;
@@ -1750,7 +1845,13 @@ void glr_push_line(GlRenderer* renderer, RendererPosition pos[2], RendererColor 
         const GpuOp* last = &frame->ops[frame->op_count - 1];
         if (last->type == GPU_OP_BATCH && last->index == frame->batch_count - 1) {
             GpuBatch* c = &frame->batches[last->index];
-            if (c->is_lines && !c->texture_enabled && !c->semi_trans_enabled
+            /* Not a batch a synchronous readback has already run (s_exec_from
+             * is past it): its vertex count was fixed when it was drawn, and
+             * growing it now would add lines that are never drawn. The GPU
+             * thread only moves s_exec_from while this thread is blocked in
+             * glr_read_vram_rect(), so reading it here is safe. */
+            if (frame->op_count > s_exec_from[wi]
+                && c->is_lines && !c->texture_enabled && !c->semi_trans_enabled
                 && c->vertex_start + c->vertex_count == s_vtx[wi]
                 && c->dither_enabled    == renderer->dither_enabled
                 && c->set_mask_enabled  == renderer->set_mask_enabled
@@ -2071,6 +2172,67 @@ static void glr_apply_vsync_preference(void) {
                               want, SDL_GetError());
 }
 
+/* Put the slot's vertices that are not in the VBOs yet into them, at their
+ * own indices, so every batch can draw straight out of [vertex_start, +count).
+ * Starting a slot from zero orphans each buffer first (glBufferData with no
+ * data): the driver hands back fresh storage instead of making this upload
+ * wait for the previous frame's draws, which are still reading the old one. */
+static void glr_upload_slot_vertices(GlRenderer* renderer, int slot) {
+    const uint32_t from = s_vtx_uploaded[slot], to = s_vtx[slot];
+    if (to <= from) return;
+    const uint32_t n = to - from;
+    struct { GLuint buf; size_t elem; const void* base; } a[4] = {
+        { renderer->position_buffer, sizeof(RendererPosition), s_pos[slot] },
+        { renderer->color_buffer,    sizeof(RendererColor),    s_col[slot] },
+        { renderer->texcoord_buffer, sizeof(RendererTexCoord), s_tex[slot] },
+        { renderer->tpage_buffer,    sizeof(RendererTPage),    s_tpg[slot] },
+    };
+    for (int i = 0; i < 4; i++) {
+        glBindBuffer(GL_ARRAY_BUFFER, a[i].buf);
+        if (from == 0)
+            glBufferData(GL_ARRAY_BUFFER, (GLsizeiptr)(VERTEX_BUFFER_LEN * a[i].elem), NULL, GL_DYNAMIC_DRAW);
+        glBufferSubData(GL_ARRAY_BUFFER, (GLintptr)(from * a[i].elem), (GLsizeiptr)(n * a[i].elem),
+                        (const uint8_t*)a[i].base + from * a[i].elem);
+    }
+    glBindBuffer(GL_ARRAY_BUFFER, 0);
+    s_vtx_uploaded[slot] = to;
+}
+
+/* Run a slot's outstanding ops into vram_tex, in submission order (a texture
+ * page re-uploaded mid-frame must only be seen by the draws issued after it;
+ * see GpuOp). Shared by the frame replay and the synchronous readback, which
+ * runs the write slot part of the way; s_exec_from keeps either from running
+ * an op twice. */
+static void glr_replay_slot(GlRenderer* renderer, int slot) {
+    /* Bind FBO for all draw commands; the viewport MUST match the FBO size, not the window. */
+    glBindFramebuffer(GL_FRAMEBUFFER, renderer->display_fbo);
+    glViewport(0, 0, 1024, 512);
+    glr_upload_slot_vertices(renderer, slot);
+
+    GlrReplay ctx;
+    glr_replay_begin(&ctx);
+    for (uint32_t i = s_exec_from[slot]; i < s_frame[slot].op_count; i++) {
+        const GpuOp* op = &s_frame[slot].ops[i];
+        if (op->type == GPU_OP_VRAM_UPDATE) {
+            glr_execute_one_vram_update(renderer, &s_frame[slot].vram_updates[op->index], slot);
+            /* It rebinds the texture unit (and the framebuffer) for its own
+             * upload, and it writes VRAM: rebind before the next batch, and
+             * treat it as a write for the barrier. */
+            ctx.bound   = false;
+            ctx.written = true;
+        } else {
+            glr_draw_gl(renderer, &s_frame[slot].batches[op->index], &ctx);
+        }
+    }
+    s_exec_from[slot] = s_frame[slot].op_count;
+
+    /* Leave the context as the old per-batch code did between batches. */
+    glBindVertexArray(0);
+    glUseProgram(0);
+    glBindTexture(GL_TEXTURE_2D, 0);
+    glDisable(GL_BLEND);
+}
+
 /* GPU thread argument */
 typedef struct {
     GlRenderer*     renderer;
@@ -2084,16 +2246,8 @@ static GpuThreadArg s_gpu_thread_arg;
  * pixel the caller has drawn so far, then copies the requested rect back into
  * the CPU-side VRAM. */
 static void glr_service_sync_readback(GlRenderer* renderer, int wi) {
+    glr_replay_slot(renderer, wi);
     glBindFramebuffer(GL_FRAMEBUFFER, renderer->display_fbo);
-    glViewport(0, 0, 1024, 512);
-    for (uint32_t i = s_exec_from[wi]; i < s_frame[wi].op_count; i++) {
-        const GpuOp* op = &s_frame[wi].ops[i];
-        if (op->type == GPU_OP_VRAM_UPDATE)
-            glr_execute_one_vram_update(renderer, &s_frame[wi].vram_updates[op->index], wi);
-        else
-            glr_draw_gl(renderer, &s_frame[wi].batches[op->index], wi);
-    }
-    s_exec_from[wi] = s_frame[wi].op_count;
 
     /* Read only the rect. display_fbo has vram_tex as its colour attachment and
      * glReadPixels returns rows in the same order glTexSubImage2D uploads them,
@@ -2169,19 +2323,9 @@ static int gpu_thread_main(void* userdata) {
         int ri = 1 - renderer->write_idx; /* read slot = opposite of current write slot */
         SDL_UnlockMutex(renderer->gpu_mutex); /* frames_pending stays 1 until render+reset done */
 
-        /* Bind FBO for all draw commands — viewport MUST match FBO size, not window */
-        glBindFramebuffer(GL_FRAMEBUFFER, renderer->display_fbo);
-        glViewport(0, 0, 1024, 512);
-
-        /* Replay VRAM updates and draw batches in original submission order —
-         * required when a texture page is re-uploaded mid-frame (see GpuOp). */
-        for (uint32_t i = s_exec_from[ri]; i < s_frame[ri].op_count; i++) {
-            const GpuOp* op = &s_frame[ri].ops[i];
-            if (op->type == GPU_OP_VRAM_UPDATE)
-                glr_execute_one_vram_update(renderer, &s_frame[ri].vram_updates[op->index], ri);
-            else
-                glr_draw_gl(renderer, &s_frame[ri].batches[op->index], ri);
-        }
+        /* Replay VRAM updates and draw batches in original submission order,
+         * from wherever a synchronous readback left the slot. */
+        glr_replay_slot(renderer, ri);
 
         /* Serviced here: every op for this frame has run, so vram_tex holds
          * both the uploads and the rasterized pixels, and the scanout pass
@@ -2225,7 +2369,11 @@ static int gpu_thread_main(void* userdata) {
         /* VRAM viewer: decode the whole unified VRAM for the debug window. Runs
          * after scanout so it shows the same frame the screen shows, and reads
          * vram_tex — the CPU-side mirror never sees rasterised pixels. */
-        if (renderer->viewer_program) {
+        /* Only while the viewer is on screen (view.enabled, set by debug_ui.cpp
+         * with the frame's snapshot): it is a 1024x512 fullscreen pass, half a
+         * million fragments a field, and it used to run in the gameplay shell
+         * too, where nothing ever displays it. */
+        if (renderer->viewer_program && s_frame[ri].view.enabled) {
             const VramViewParams* vv = &s_frame[ri].view;
             glBindFramebuffer(GL_FRAMEBUFFER, renderer->viewer_fbo);
             glViewport(0, 0, 1024, 512);
@@ -2310,6 +2458,7 @@ static int gpu_thread_main(void* userdata) {
         s_frame[ri].op_count           = 0;
         s_frame[ri].imgui_draw_data    = NULL;
         s_vtx[ri]                      = 0;
+        s_vtx_uploaded[ri]             = 0;
         s_vram_pool_used[ri]           = 0;
         s_exec_from[ri]                = 0;
 
@@ -2345,6 +2494,7 @@ void glr_start_gpu_thread(GlRenderer* renderer, SDL_Window* window, SDL_GLContex
         s_frame[i].op_count          = 0;
         s_frame[i].imgui_draw_data   = NULL;
         s_vtx[i]           = 0;
+        s_vtx_uploaded[i]  = 0;
         s_vram_pool_used[i] = 0;
         s_exec_from[i]      = 0;
     }

@@ -1298,7 +1298,7 @@ static void draw_lua_console_window(void) {
 // ---------------------------------------------------------------------------
 
 // VRAM viewer state — mirrors PCSX-Redux's vram-viewer widget controls.
-static VramViewParams g_vram_view = { VRAM_VIEW_16BPP, 0, false, false, 0, 0 };
+static VramViewParams g_vram_view = { VRAM_VIEW_16BPP, 0, false, false, 0, 0, false };
 static float  g_vram_zoom     = 1.0f;
 static ImVec2 g_vram_pan      = ImVec2(0, 0);   // in VRAM pixels, top-left of view
 static bool   g_vram_grid     = false;          // 16x16 pixel grid
@@ -1310,9 +1310,26 @@ static bool   g_vram_show_disp = true;          // outline the active display ar
 
 bool debug_ui_vram_viewer_open(void) { return g_show_vram_viewer; }
 
+/* Whether the viewer was drawn this frame. The renderer runs its decode pass (a
+ * 1024x512 fullscreen draw on the GPU thread) only while the params it is
+ * handed say enabled, so this frame's answer travels with the params: true from
+ * draw_vram_viewer_window(), false from vram_view_publish_hidden() on every
+ * frame that did not draw it, the gameplay shell included. Pushed every frame
+ * rather than on change, so a backend that has just been switched in cannot
+ * keep a stale "enabled" from before the switch. */
+static bool g_vram_viewer_drawn = false;
+
+static void vram_view_publish_hidden(Interconnect* inter) {
+    if (!inter || g_vram_viewer_drawn) return;
+    g_vram_view.enabled = false;
+    renderer_set_vram_view_params(&inter->gpu.renderer, &g_vram_view);
+}
+
 static void draw_vram_viewer_window(Renderer* renderer, Interconnect* inter) {
     if (!g_show_vram_viewer || !renderer) return;
 
+    g_vram_view.enabled = true;
+    g_vram_viewer_drawn = true;
     renderer_set_vram_view_params(renderer, &g_vram_view);
     GfxTexHandle tex = renderer_get_vram_viewer_texture(renderer);
 
@@ -4215,6 +4232,7 @@ extern "C" void debug_ui_render(void* cpu_ptr, void* interconnect_ptr) {
     /* ImGui_ImplOpenGL3_NewFrame() moved to GPU thread — owns GL context */
     ImGui_ImplSDL3_NewFrame();
     ImGui::NewFrame();
+    g_vram_viewer_drawn = false;
 
     /* Two shells, one window. The gameplay shell draws the screen and its
      * overlay and nothing else — no dockspace, no rail, no log dock, so none of
@@ -4222,6 +4240,7 @@ extern "C" void debug_ui_render(void* cpu_ptr, void* interconnect_ptr) {
     if (g_shell == SHELL_GAMEPLAY) {
         draw_gameplay_shell(cpu, inter);
         gp_handle_keys(inter);
+        vram_view_publish_hidden(inter);
         ImGui::Render();
         return;
     }
@@ -4368,6 +4387,7 @@ extern "C" void debug_ui_render(void* cpu_ptr, void* interconnect_ptr) {
         }
     }
 
+    vram_view_publish_hidden(inter);
     ImGui::Render();
     /* ImGui_ImplOpenGL3_RenderDrawData moved to GPU thread via imgui_render_draw_data() */
 }

@@ -636,6 +636,122 @@ static int l_emu_cd_audio(lua_State* L) {
     return 8;
 }
 
+/* ---- read-only audio state: emu.spu_voice / emu.spu_irq / emu.cd_state ----
+ * Straight reads of the structs, each returned as a table of named fields. No
+ * spu_catch_up and no FIFO pop, so calling them changes nothing: a probe that
+ * read through the register path would advance the SPU it is measuring. The
+ * values are as of the last catch-up, at most one SPU event (64 samples) old. */
+
+static void audio_field_int(lua_State* L, const char* key, lua_Integer v) {
+    lua_pushinteger(L, v);
+    lua_setfield(L, -2, key);
+}
+
+static void audio_field_bool(lua_State* L, const char* key, bool v) {
+    lua_pushboolean(L, v);
+    lua_setfield(L, -2, key);
+}
+
+/* emu.spu_voice(n), n = 0..23: one voice's registers and internal state.
+ * Addresses are byte addresses in SPU RAM except the *_reg fields, which are
+ * the registers as written (units of 8 bytes). */
+static int l_emu_spu_voice(lua_State* L) {
+    lua_Integer n = luaL_checkinteger(L, 1);
+    luaL_argcheck(L, n >= 0 && n < NUM_VOICES, 1, "voice index out of range (0..23)");
+    const Spu* spu = &g_inter->spu;
+    const SpuVoice* v = &spu->voices[n];
+    lua_createtable(L, 0, 24);
+    audio_field_bool(L, "on",            v->on);
+    audio_field_int(L,  "curr_addr",     (lua_Integer)v->curr_addr);
+    audio_field_int(L,  "start_reg",     (lua_Integer)v->start_address);
+    audio_field_int(L,  "repeat_reg",    (lua_Integer)v->repeat_address);
+    audio_field_int(L,  "repeat_addr",   (lua_Integer)v->repeat_address * 8);
+    audio_field_int(L,  "sbpos",         (lua_Integer)v->SBPos);
+    audio_field_bool(L, "end_mute_owed", v->reach_end);
+    audio_field_int(L,  "adsr_state",    (lua_Integer)v->adsr_state);   /* 0 A, 1 D, 2 S, 3 R, 4 off */
+    audio_field_int(L,  "envelope",      (lua_Integer)v->EnvelopeVol);
+    audio_field_int(L,  "envx",          (lua_Integer)(uint16_t)v->adsr_volume);
+    audio_field_int(L,  "adsr1",         (lua_Integer)v->adsr_low);
+    audio_field_int(L,  "adsr2",         (lua_Integer)v->adsr_high);
+    audio_field_int(L,  "vol_left_reg",  (lua_Integer)v->volume_left);
+    audio_field_int(L,  "vol_right_reg", (lua_Integer)v->volume_right);
+    audio_field_int(L,  "vol_left",      (lua_Integer)v->vol_left);     /* current, signed */
+    audio_field_int(L,  "vol_right",     (lua_Integer)v->vol_right);
+    audio_field_int(L,  "pitch",         (lua_Integer)v->pitch);
+    audio_field_int(L,  "out",           (lua_Integer)v->sval);         /* VxOUTX, after ADSR */
+    audio_field_bool(L, "endx",          (spu->endx >> n) & 1u);
+    audio_field_bool(L, "reverb",        (spu->reverb_on >> n) & 1u);
+    audio_field_bool(L, "noise",         (spu->noise_mode >> n) & 1u);
+    audio_field_bool(L, "pitch_mod",     (spu->pitch_mod >> n) & 1u);
+    return 1;
+}
+
+/* emu.spu_irq(): IRQ9 state, the transfer pointer and the global volumes. */
+static int l_emu_spu_irq(lua_State* L) {
+    const Spu* spu = &g_inter->spu;
+    lua_createtable(L, 0, 20);
+    audio_field_int(L,  "irq_reg",          (lua_Integer)spu->irq_addr);
+    audio_field_int(L,  "irq_addr",         (lua_Integer)spu->irq_addr * 8);
+    audio_field_bool(L, "irq9_flag",        spu->irq9_flag);
+    audio_field_bool(L, "irq9_enable",      (spu->control & SPU_CTRL_IRQ9_ENABLE) != 0);
+    audio_field_int(L,  "control",          (lua_Integer)spu->control);
+    audio_field_int(L,  "status",           (lua_Integer)spu->status);
+    audio_field_int(L,  "transfer_reg",     (lua_Integer)spu->transfer_addr_reg);
+    audio_field_int(L,  "transfer_addr",    (lua_Integer)spu->transfer_addr);
+    audio_field_int(L,  "manual_fifo",      (lua_Integer)spu->manual_fifo_count);
+    audio_field_int(L,  "main_vol_left_reg",  (lua_Integer)spu->main_vol_left);
+    audio_field_int(L,  "main_vol_right_reg", (lua_Integer)spu->main_vol_right);
+    audio_field_int(L,  "main_vol_left",    (lua_Integer)spu->main_vol_left_cur);
+    audio_field_int(L,  "main_vol_right",   (lua_Integer)spu->main_vol_right_cur);
+    audio_field_int(L,  "cd_vol_left",      (lua_Integer)spu->cd_vol_left);
+    audio_field_int(L,  "cd_vol_right",     (lua_Integer)spu->cd_vol_right);
+    audio_field_int(L,  "cd_in_left",       (lua_Integer)spu->cd_audio_left);
+    audio_field_int(L,  "cd_in_right",      (lua_Integer)spu->cd_audio_right);
+    audio_field_bool(L, "muted",            spu->muted);
+    audio_field_int(L,  "endx",             (lua_Integer)spu->endx);
+    audio_field_int(L,  "capture_pos",      (lua_Integer)spu->capture_pos);
+    return 1;
+}
+
+/* emu.cd_state(): the drive's state, mode, XA filter, output stage and the
+ * GetlocL latch. header is the 8 bytes GetlocL answers with: mm, ss, ff
+ * (BCD), mode, file, channel, submode, coding info. */
+static int l_emu_cd_state(lua_State* L) {
+    const Cdrom* cd = &g_inter->cdrom;
+    lua_createtable(L, 0, 28);
+    audio_field_int(L,  "drive_state",      (lua_Integer)cd->drive_state); /* 0 idle 1 spinup 2 seek 3 read 4 play 5 pausing 6 stopping */
+    audio_field_int(L,  "interrupt_flag",   (lua_Integer)cd->interrupt_flag);
+    audio_field_int(L,  "interrupt_enable", (lua_Integer)cd->interrupt_enable);
+    audio_field_int(L,  "mode",             (lua_Integer)cd->mode);
+    audio_field_bool(L, "xa_adpcm",         cd->xa_adpcm_enable);
+    audio_field_bool(L, "xa_filter",        cd->xa_filter_enable);
+    audio_field_int(L,  "filter_file",      (lua_Integer)cd->xa_filter_file);
+    audio_field_int(L,  "filter_channel",   (lua_Integer)cd->xa_filter_channel);
+    audio_field_bool(L, "muted",            cd->muted);
+    audio_field_bool(L, "adpmute",          cd->xa_mute);
+    audio_field_bool(L, "adpbusy",          cdrom_xa_playing(cd));
+    audio_field_int(L,  "atv_ll",           (lua_Integer)cd->vol_ll);
+    audio_field_int(L,  "atv_lr",           (lua_Integer)cd->vol_lr);
+    audio_field_int(L,  "atv_rl",           (lua_Integer)cd->vol_rl);
+    audio_field_int(L,  "atv_rr",           (lua_Integer)cd->vol_rr);
+    audio_field_int(L,  "current_lba",      (lua_Integer)cd->current_lba);
+    audio_field_int(L,  "head_lba",         (lua_Integer)cd->head_lba);
+    audio_field_bool(L, "seek_phase",       cd->seek_phase);
+    audio_field_bool(L, "auto_pause",       cd->auto_pause);
+    audio_field_int(L,  "subq_track",       (lua_Integer)cd->last_subq.track_bcd);
+    audio_field_int(L,  "sectors",          (lua_Integer)cd->sectors_read_total);
+    audio_field_int(L,  "xa_sectors",       (lua_Integer)cd->xa_sectors_total);
+    audio_field_int(L,  "audio_fifo",       (lua_Integer)cd->audio_fifo.count);
+    audio_field_bool(L, "header_valid",     cd->last_header_valid);
+    lua_createtable(L, 8, 0);
+    for (int i = 0; i < 8; i++) {
+        lua_pushinteger(L, (lua_Integer)cd->last_header[i]);
+        lua_rawseti(L, -2, i + 1);
+    }
+    lua_setfield(L, -2, "header");
+    return 1;
+}
+
 /* Host wall-clock milliseconds. Emulated cycles against this is the emulator's
  * real-time speed, which is what decides whether the audio device can be fed at
  * the rate it drains. */
@@ -776,6 +892,9 @@ static const luaL_Reg s_emu_funcs[] = {
     {"spu_stats",         l_emu_spu_stats},
     {"reverb",            l_emu_reverb},
     {"cd_audio",          l_emu_cd_audio},
+    {"spu_voice",         l_emu_spu_voice},
+    {"spu_irq",           l_emu_spu_irq},
+    {"cd_state",          l_emu_cd_state},
     {"vram_compare",      l_emu_vram_compare},
     {"host_ms",           l_emu_host_ms},
     {"irq",               l_emu_irq},

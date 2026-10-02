@@ -131,6 +131,32 @@ typedef struct {
 
 /* --- writer ------------------------------------------------------------- */
 
+/* Pixels of a GP0(A0h) upload still in progress. Until the last word arrives
+ * they exist only in the CPU copy of VRAM (gpu_commands.c pushes the rectangle
+ * to the renderer when the upload completes), so the whole-VRAM readback below
+ * would replace them with what the renderer holds, and the completed upload
+ * would then push those stale pixels everywhere. They are held aside across the
+ * readback. Static: up to a whole VRAM's worth, and saving is not a hot path. */
+static uint16_t s_upload_hold[VRAM_WIDTH * VRAM_HEIGHT];
+
+static uint32_t upload_pixel_offset(const Gpu* gpu, uint32_t i) {
+    const uint32_t col = i % gpu->vram_load_w, row = i / gpu->vram_load_w;
+    return (((uint32_t)gpu->vram_load_y + row) & 0x1FFu) * VRAM_WIDTH
+         + (((uint32_t)gpu->vram_load_x + col) & 0x3FFu);
+}
+
+/* Copies the received part of an in-progress upload between VRAM and the hold
+ * buffer (to_hold selects the direction); returns how many pixels it moved. */
+static uint32_t partial_upload_exchange(Gpu* gpu, uint32_t count, bool to_hold) {
+    uint16_t* vram = (uint16_t*)(void*)gpu->vram.data;
+    for (uint32_t i = 0; i < count; i++) {
+        uint32_t off = upload_pixel_offset(gpu, i);
+        if (to_hold) s_upload_hold[i] = vram[off];
+        else         vram[off] = s_upload_hold[i];
+    }
+    return count;
+}
+
 static bool put_section(FILE* f, uint32_t tag, const void* data, size_t size) {
     uint32_t sz = (uint32_t)size;
     if (fwrite(&tag, 4, 1, f) != 1) return false;
@@ -167,9 +193,18 @@ bool savestate_save(const char* path, struct Cpu* cpu, struct Interconnect* inte
      * it back first. The wait lets the field already submitted finish on the
      * GPU thread; the readback itself is synchronous through it. With no live
      * renderer there is nothing to pull and the CPU copy is saved as before. */
-    renderer_wait_frame_done(&inter->gpu.renderer);
-    if (renderer_read_vram_rect(&inter->gpu.renderer, (uint16_t*)(void*)inter->gpu.vram.data,
-                                0, 0, VRAM_WIDTH, VRAM_HEIGHT))
+    Gpu* gpu = &inter->gpu;
+    uint32_t held = 0;
+    if (gpu->gp0_mode == GP0_MODE_IMAGE_LOAD && gpu->vram_load_w && gpu->vram_load_h) {
+        uint32_t total = (uint32_t)gpu->vram_load_w * gpu->vram_load_h;
+        held = partial_upload_exchange(gpu, gpu->vram_load_count < total ? gpu->vram_load_count : total,
+                                       true);
+    }
+    renderer_wait_frame_done(&gpu->renderer);
+    bool pulled = renderer_read_vram_rect(&gpu->renderer, (uint16_t*)(void*)gpu->vram.data,
+                                          0, 0, VRAM_WIDTH, VRAM_HEIGHT);
+    partial_upload_exchange(gpu, held, false);
+    if (pulled)
         vram_raster_clear(0, 0, VRAM_WIDTH, VRAM_HEIGHT);   /* the CPU copy is now the whole truth */
     else
         LOG_SYSTEM_WARN("[STATE] VRAM readback refused: saving the CPU copy only, "
@@ -402,6 +437,7 @@ bool savestate_load(const char* path, struct Cpu* cpu, struct Interconnect* inte
     /* State the MDEC keeps outside its saved span (the idle value of status
      * bits 15-0) is re-derived rather than left at whatever this session had. */
     mdec_state_restored(&inter->mdec);
+    dma_transient_reset();
 
     /* VBlank must always be in the queue. It is the frame boundary, the source
      * of IRQ0 and the only event that re-arms itself, so a state that lost it —

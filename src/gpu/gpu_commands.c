@@ -216,6 +216,22 @@ static void gpu_vram_push(Gpu* gpu, uint32_t x, uint32_t y, uint32_t w, uint32_t
     }
 }
 
+/* A GP0(A0h) upload cut short by GP1(01h) or GP1(00h) still wrote the pixels
+ * it had received: on hardware they are in VRAM. Here they reach the renderer
+ * only when an upload completes, so an aborted one left them in the CPU copy
+ * alone, and with the readback tile map trusting the CPU copy there, GP0(C0h)
+ * returned pixels that textures and the screen never showed. Push the whole
+ * rows received, then the part of the last one. */
+void gpu_flush_partial_upload(Gpu* gpu) {
+    if (gpu->gp0_mode != GP0_MODE_IMAGE_LOAD || gpu->vram_load_w == 0) return;
+    const uint32_t w     = gpu->vram_load_w;
+    const uint32_t total = w * gpu->vram_load_h;
+    const uint32_t got   = gpu->vram_load_count < total ? gpu->vram_load_count : total;
+    const uint32_t rows  = got / w, rest = got % w;
+    if (rows) gpu_vram_push(gpu, gpu->vram_load_x, gpu->vram_load_y, w, rows);
+    if (rest) gpu_vram_push(gpu, gpu->vram_load_x, (gpu->vram_load_y + rows) & 0x1FFu, rest, 1);
+}
+
 // ---------------------------------------------------------------------------
 // Helper: Draw a rectangle as a quad
 // ---------------------------------------------------------------------------

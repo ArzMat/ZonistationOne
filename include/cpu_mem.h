@@ -33,6 +33,9 @@ extern const uint32_t REGION_MASK[8];
  * which reads ZS1_RAM_LOAD_STALL once, primed in bus_hw_tables_init() before
  * the first instruction runs. */
 extern uint32_t g_bus_ram_load_stall;
+/* ZS1_DMA_STALL=doc: a DMA busy window is open, and a CPU read of RAM has to
+   take the full path so it waits for the transfer (bus.c, dma_doc_cpu_read). */
+extern bool g_bus_dma_window_open;
 
 /* Main RAM, mirrored four times across the first 8 MB of the physical map. The
  * same bound bus.c uses for both the data access and its stall charge. */
@@ -73,6 +76,7 @@ static inline bool cpu_ram_fast_ok(const Interconnect* inter, uint32_t addr,
     const uint32_t phys = bus_mask_region(addr);
     if (__builtin_expect(((addr & align_mask) != 0) |
                          (inter->debugger.read_watchpoint_count != 0) |
+                         g_bus_dma_window_open |
                          (phys >= CPU_MEM_RAM_WINDOW_END), 0))
         return false;
     *off_out = phys & (RAM_SIZE - 1);

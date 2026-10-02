@@ -213,6 +213,8 @@ uint32_t gpu_read_data(Gpu* gpu);         // Reads data from GPUREAD port (e.g.,
 void gpu_init_full(Gpu* gpu, Interconnect* inter);
 // GPU soft reset (does NOT clear VRAM)
 void gpu_soft_reset(Gpu* gpu);
+/* Push the pixels an interrupted GP0(A0h) upload already wrote (gpu_commands.c). */
+void gpu_flush_partial_upload(Gpu* gpu);
 /* Re-send every piece of persistent drawing state to the renderer.
  * The ten renderer_set_* values live in the backend, not in Gpu, so a backend
  * that has just been created starts from its own defaults and would draw the

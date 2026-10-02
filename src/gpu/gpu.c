@@ -300,6 +300,7 @@ static void gp1_reset(Gpu* gpu, uint32_t value) {
 static void gp1_reset_command_buffer(Gpu* gpu, uint32_t value) {
     (void)value;
     LOG_GPU_DEBUG("[GPU] GPU: Reset Command Buffer (GP1 0x01)");
+    gpu_flush_partial_upload(gpu);
     gpu_clear_cmd_buf(gpu);
     gpu->gp0_words_remaining = 0;
     gpu->gp0_mode = GP0_MODE_COMMAND;
@@ -748,6 +749,7 @@ void gpu_reapply_renderer_state(Gpu* gpu) {
 
 void gpu_soft_reset(Gpu* gpu) {
     LOG_GPU_DEBUG("[GPU] GPU soft reset (VRAM preserved)");
+    gpu_flush_partial_upload(gpu);
     gpu_reset_state(gpu);
     LOG_GPU_DEBUG("[GPU] GPU Soft Reset complete.");
 }

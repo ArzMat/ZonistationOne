@@ -105,6 +105,10 @@ void dma_update_irq(Dma* dma);
 void dma_flag_bus_error(Dma* dma);
 
 void dma_init(Dma* dma, struct Interconnect* inter);
+/* Clears the DMA state kept outside Dma (dma.c's writeback guard and, in bus.c,
+ * the ZS1_DMA_STALL=doc busy window); called after a savestate load. */
+void dma_transient_reset(void);
+void dma_doc_window_reset(void);   /* defined in bus.c */
 uint32_t dma_read(Dma* dma, uint32_t offset);
 bool dma_write(Dma* dma, uint32_t offset, uint32_t value);
 bool dma_channel_is_active(DmaChannel* ch);

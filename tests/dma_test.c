@@ -23,6 +23,7 @@ void log_print(LogCategory category, LogLevel level, const char* format, ...) {
 }
 LogLevel log_get_current_level(void) { return LOG_LEVEL_SILENT; }
 void lua_debug_notify(const char* event_name) { (void)event_name; }
+void dma_doc_window_reset(void) {}   /* bus.c */
 
 #include "../src/core/dma.c"
 

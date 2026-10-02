@@ -400,9 +400,20 @@ static uint32_t hw_mdec_read(Interconnect* inter, uint32_t addr, BusSize sz) {
      * their size" (psx-spx system/unpredictablethings.md:58-60): a narrower read
      * returns its part of the 32-bit register. mdec_read() only knows the two
      * word addresses, so 1F801822h and 1F801826h read 0 and an lhu of the
-     * status' upper half (busy, DREQ, FIFO flags) always saw "idle". The data
-     * port at 1F801822h now pops a word like 1F801820h already did; whether a
-     * narrow read of it advances the FIFO on hardware is not documented. */
+     * status' upper half (busy, DREQ, FIFO flags) always saw "idle".
+     *
+     * The data port is the exception: a read of it pops the output FIFO, and
+     * how a narrow read advances that FIFO on hardware is not documented. The
+     * conservative reading is one word per word's worth of reads: a narrow read
+     * that starts the word (1F801820h) pops it, and the reads of its other
+     * bytes (1F801821h..1F801823h) return parts of that same word, so an lhu
+     * pair at 820h/822h takes one word, not two. */
+    static uint32_t s_data_word;          /* word the last narrow data read popped */
+    if (sz != BUS_WORD && (addr & ~3u) == 0x1F801820u) {
+        if ((addr & 3u) == 0) s_data_word = mdec_read(&inter->mdec, 0x1F801820u);
+        if (sz == BUS_HWORD) return (uint16_t)(s_data_word >> ((addr & 2) << 3));
+        return (uint8_t)(s_data_word >> ((addr & 3) << 3));
+    }
     uint32_t v32 = mdec_read(&inter->mdec, addr & ~3u);
     if (sz == BUS_WORD)  return v32;
     if (sz == BUS_HWORD) return (uint16_t)(v32 >> ((addr & 2) << 3));
@@ -614,7 +625,9 @@ static uint32_t ram_load_stall(void) {
  * the variable unset nothing here runs and the accidental stall above is kept
  * exactly as it was. */
 static int      s_dma_stall_doc = -1;
-static bool     s_dma_window_open = false;   /* only ever true in the doc model */
+/* Not static: the CPU's RAM fast path (cpu_mem.h) must fall back to the full
+ * load while a window is open, or its reads would never wait. */
+bool            g_bus_dma_window_open = false;   /* only ever true in the doc model */
 static uint32_t s_dma_window_end;            /* cpu_cycle_counter the window ends at */
 
 static bool dma_stall_doc(void) {
@@ -628,15 +641,24 @@ static bool dma_stall_doc(void) {
     return s_dma_stall_doc != 0;
 }
 
+/* A savestate load replaces the cycle counter, so a window opened before the
+ * load would make the first read after it wait until a cycle that belongs to
+ * the old timeline. Transfers restored from the state reopen their windows
+ * when their next slice runs. */
+void dma_doc_window_reset(void) {
+    g_bus_dma_window_open = false;
+    s_dma_window_end = 0;
+}
+
 /* Open (or extend) the busy window: the transfer runs from now for `ticks`.
  * "Now" includes what the current instruction already owes, since a kick from
  * a CHCR store happens inside the instruction, before that cost is added. */
 static void dma_doc_busy_for(Interconnect* inter, uint32_t ticks) {
     if (ticks == 0 || !dma_stall_doc()) return;
     const uint32_t end = inter->cpu_cycle_counter + inter->cpu_mem_stall_cycles + ticks;
-    if (!s_dma_window_open || (int32_t)(end - s_dma_window_end) > 0)
+    if (!g_bus_dma_window_open || (int32_t)(end - s_dma_window_end) > 0)
         s_dma_window_end = end;
-    s_dma_window_open = true;
+    g_bus_dma_window_open = true;
 }
 
 /* A CPU read while a window is open: RAM and the I/O ports wait for the rest of
@@ -657,7 +679,7 @@ static void __attribute__((noinline)) dma_doc_cpu_read(Interconnect* inter, uint
         inter->cpu_cycle_counter += (uint32_t)left;
         if (inter->cpu) inter->cpu->downcount -= left;
     }
-    s_dma_window_open = false;   /* the CPU is at or past the end of it now */
+    g_bus_dma_window_open = false;   /* the CPU is at or past the end of it now */
 }
 
 /* RAM_SIZE bit 7 gates the documented contention cycle. hw_memctrl2_read returns
@@ -667,7 +689,7 @@ static void __attribute__((noinline)) dma_doc_cpu_read(Interconnect* inter, uint
 static inline void bus_charge_cpu_load(Interconnect* inter, uint32_t phys) {
     if (phys < 0x00800000)                   /* main RAM, mirrored */
         inter->cpu_mem_stall_cycles += ram_load_stall();
-    if (s_dma_window_open)                   /* ZS1_DMA_STALL=doc only, see above */
+    if (g_bus_dma_window_open)                   /* ZS1_DMA_STALL=doc only, see above */
         dma_doc_cpu_read(inter, phys);
     /* BIOS ROM *data* reads stay free. Tried 2026-08-17 (one extra comparison
      * here, charging inter->bios_access_cycles): it did not reproduce the old

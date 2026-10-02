@@ -30,6 +30,7 @@ const uint32_t REGION_MASK[8] = {
     0x7fffffff, 0x1fffffff, 0xffffffff, 0xffffffff
 };
 uint32_t g_bus_ram_load_stall = 3;
+bool g_bus_dma_window_open = false;   /* ZS1_DMA_STALL=doc window, bus.c */
 
 LogLevel current_log_level = LOG_LEVEL_INFO;
 void log_print(LogCategory category, LogLevel level, const char* format, ...) {
@@ -146,6 +147,13 @@ int main(void) {
     g_inter.debugger.write_watchpoint_count = 1;
     expect_fast32(0x80001000u, 0x1000u);
     g_inter.debugger.write_watchpoint_count = 0;
+
+    /* --- ZS1_DMA_STALL=doc: an open DMA window sends RAM loads to the bus,
+     *     where they wait for the transfer (bus.c, dma_doc_cpu_read) --- */
+    g_bus_dma_window_open = true;
+    expect_slow32(0x80001000u);
+    g_bus_dma_window_open = false;
+    expect_fast32(0x80001000u, 0x1000u);
 
     /* --- the stall follows ZS1_RAM_LOAD_STALL --- */
     g_bus_ram_load_stall = 0;

@@ -378,9 +378,18 @@ static bool switch_gfx_backend(SdlCtx* sdl, Interconnect* inter,
     /* 5. Put the machine's picture and its drawing state into the new backend,
      *    in that order: the state setters are cheap and the upload is what the
      *    next frame samples. */
-    if (have_vram)
+    if (have_vram) {
         renderer_upload_vram_rect(&inter->gpu.renderer, vram_carry,
                                   0, 0, VRAM_WIDTH, VRAM_HEIGHT);
+    } else {
+        /* Without the old renderer's picture, the CPU copy is the best there
+         * is: everything the CPU, DMA and MDEC wrote. Leaving the new backend
+         * empty lost even that, while the readback tile map went on treating
+         * the CPU copy as matching the renderer. Now they do match. */
+        renderer_upload_vram_rect(&inter->gpu.renderer, (const uint16_t*)inter->gpu.vram.data,
+                                  0, 0, VRAM_WIDTH, VRAM_HEIGHT);
+        vram_raster_clear(0, 0, VRAM_WIDTH, VRAM_HEIGHT);
+    }
     gpu_reapply_renderer_state(&inter->gpu);
 
     /* 6. ImGui's two halves against the new window and device, then the thread.

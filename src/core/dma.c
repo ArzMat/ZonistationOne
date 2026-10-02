@@ -92,6 +92,13 @@ void dma_channel_progress(DmaChannel* ch, uint32_t next_addr, uint32_t remaining
  * next start clears it. */
 static uint8_t s_guest_regs_during_transfer = 0;
 
+/* Called after a savestate load: a guest write recorded on the old timeline
+ * must not suppress, or allow, the writeback of a transfer the state restored. */
+void dma_transient_reset(void) {
+    s_guest_regs_during_transfer = 0;
+    dma_doc_window_reset();
+}
+
 static bool dma_slice_running(const Dma* dma, uint32_t channel) {
     switch (channel) {
         case 0:  return dma->mdec_in_active;

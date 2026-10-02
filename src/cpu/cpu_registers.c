@@ -6,44 +6,11 @@
  * components of this project that have other authors.
  */
 #include "cpu.h"
-#include "log.h"
 
 // --- Register Access ---
-/**
- * @brief Reads the value of a GPR from the input set (cpu->regs).
- */
-uint32_t cpu_reg(Cpu* cpu, RegisterIndex index) {
-    // No need to check index 0 specifically, as cpu->regs[0] is always 0.
-    if (index >= 32) {
-        LOG_CPU_ERROR("[CPU] GPR read index out of bounds: %u", index);
-        return 0; // Or trigger an internal error
-    }
-    return cpu->regs[index];
-}
-
-/**
- * @brief Writes a value to a GPR. R0 stays hardwired to zero.
- */
-void cpu_set_reg(Cpu* cpu, RegisterIndex index, uint32_t value) {
-    if (index >= 32) {
-        LOG_CPU_ERROR("[CPU] GPR write index out of bounds: %u", index);
-        return;
-    }
-    /* R0 is hardwired: dropping the write is the whole of it. The old code
-     * wrote into a second register file and then re-zeroed its slot 0 on every
-     * call, which the branch above already makes unnecessary. */
-    if (index != REG_ZERO) {
-        cpu->regs[index] = value;
-        /* A load in flight for this same register loses the race. Its data "isn't
-         * updated until the next opcode has completed"
-         * (psx-spx-docs/docs/cpuspecifications.md:172-174) — this write belongs to
-         * that next opcode, so it is the later one and stands. Without the cancel
-         * the load would land afterwards and quietly undo it. */
-        if (index == cpu->delay_load_reg) {
-            cpu->delay_load_reg = REG_ZERO;
-        }
-    }
-}
+/* cpu_reg() and cpu_set_reg() are static inline in cpu.h: they run two or
+ * three times per instruction, and out of line here they were a call each,
+ * plus a bounds check no caller could fail (every index is a 5-bit field). */
 
 
 // --- Branch/Jump Helper ---

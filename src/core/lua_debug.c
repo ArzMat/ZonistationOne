@@ -249,11 +249,48 @@ static int l_emu_on_break(lua_State* L) {
     g_break_cb_ref = luaL_ref(L, LUA_REGISTRYINDEX);
     return 0;
 }
+/* emu.on_event(fn [, name, ...])
+ *
+ * With only a function, fn receives every native notification, as it always
+ * has. With names after it, only those reach Lua: the filter is checked here in
+ * C, before the interpreter is entered at all.
+ *
+ * That matters because the notifications sit on hot paths (one per GTE
+ * operation, two per polygon, one per rectangle, fill, macroblock, sector) and
+ * each one that reaches Lua costs a registry lookup, a string push and a
+ * pcall, a few hundred nanoseconds; a 3D field produces thousands. A probe
+ * that wants two of them, such as scripts/host_speed.lua with "vblank" and
+ * "mdec_macroblock", was paying for all of them and so measured a slower
+ * emulator than the one it was meant to measure.
+ *
+ * Names are compared as strings (the GTE ones are the opcode names, which is
+ * why this is not a bitmask of known ids). Calling on_event again replaces both
+ * the callback and the filter. */
+#define LUA_EVENT_FILTER_MAX 16
+#define LUA_EVENT_NAME_MAX   32
+static char g_event_filter[LUA_EVENT_FILTER_MAX][LUA_EVENT_NAME_MAX];
+static int  g_event_filter_count = 0;   /* 0: every event */
+
 static int l_emu_on_event(lua_State* L) {
     luaL_checktype(L, 1, LUA_TFUNCTION);
+    const int nnames = lua_gettop(L) - 1;
+    if (nnames > LUA_EVENT_FILTER_MAX)
+        return luaL_error(L, "on_event: at most %d event names", LUA_EVENT_FILTER_MAX);
+    /* Validate every name before changing anything, so a bad call leaves the
+     * previous registration intact. */
+    for (int i = 0; i < nnames; i++) {
+        size_t len = 0;
+        luaL_checklstring(L, 2 + i, &len);
+        if (len == 0 || len >= LUA_EVENT_NAME_MAX)
+            return luaL_error(L, "on_event: event name %d must be 1..%d characters",
+                              i + 1, LUA_EVENT_NAME_MAX - 1);
+    }
     if (g_event_cb_ref != LUA_NOREF) luaL_unref(L, LUA_REGISTRYINDEX, g_event_cb_ref);
     lua_pushvalue(L, 1);
     g_event_cb_ref = luaL_ref(L, LUA_REGISTRYINDEX);
+    for (int i = 0; i < nnames; i++)
+        snprintf(g_event_filter[i], LUA_EVENT_NAME_MAX, "%s", lua_tostring(L, 2 + i));
+    g_event_filter_count = nnames;
     return 0;
 }
 
@@ -1078,6 +1115,12 @@ bool lua_debug_run_file(const char* path) {
 
 void lua_debug_notify(const char* event_name) {
     if (!g_active || g_event_cb_ref == LUA_NOREF) return;
+    /* The emu.on_event filter, before any Lua work (see l_emu_on_event). */
+    if (g_event_filter_count) {
+        int i = 0;
+        while (i < g_event_filter_count && strcmp(g_event_filter[i], event_name) != 0) i++;
+        if (i == g_event_filter_count) return;
+    }
     lua_rawgeti(g_L, LUA_REGISTRYINDEX, g_event_cb_ref);
     lua_pushstring(g_L, event_name);
     int status = lua_pcall(g_L, 1, 0, 0);

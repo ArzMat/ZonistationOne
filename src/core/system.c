@@ -61,14 +61,13 @@ void system_run_frame(Interconnect* inter, Cpu* cpu) {
     const uint32_t start = inter->cpu_cycle_counter;
     const uint32_t cap   = 2u * gpu_cycles_per_frame(&inter->gpu);
 
-    while (!inter->frame_complete) {
-        /* Just run the CPU: cpu_run_next_instruction dispatches every due
-         * scheduled event (VBlank, timers, CDROM, DMA, ...) via its downcount
-         * check, and timers now catch up on-read/on-event — no manual stepping. */
-        cpu_run_next_instruction(cpu);
-        if (dbg->paused) return;                       /* breakpoint hit mid-frame */
-        if (inter->cpu_cycle_counter - start >= cap) break;  /* safety */
-    }
+    /* Just run the CPU: every instruction dispatches each due scheduled event
+     * (VBlank, timers, CDROM, DMA, ...) via its downcount check, and timers
+     * catch up on-read/on-event, so there is no manual stepping. The loop lives
+     * in cpu_execution.c now, next to the instruction it runs, so it costs no
+     * cross-unit call per instruction; it tests frame_complete, the pause and
+     * the cap after every instruction exactly as this loop did. */
+    if (!cpu_run_frame(cpu, start, cap)) return;       /* breakpoint hit mid-frame */
 
     /* Frame boundary: publish the event ring the Frame view reads. */
     frame_events_end_frame();

@@ -318,6 +318,53 @@ void vk_swapchain_destroy(VkContext* c) {
     if (c->swapchain) { vkDestroySwapchainKHR(c->device, c->swapchain, NULL); c->swapchain = VK_NULL_HANDLE; }
 }
 
+/* ZS1_VSYNC=0|1|-1, the Vulkan side of the GL backend's swap interval.
+ *
+ * Unset: FIFO, exactly as before. Set, the closest supported mode:
+ *    0  MAILBOX (no wait, no tearing), else IMMEDIATE, else FIFO
+ *    1  FIFO
+ *   -1  FIFO_RELAXED (a late image tears instead of waiting a whole refresh),
+ *       else FIFO
+ * With FIFO, vkAcquireNextImageKHR blocks once every swapchain image is
+ * queued, and the render thread holds the frame (and so main.c's
+ * renderer_wait_frame_done) until it returns; this is the knob that takes
+ * that wait out for a measurement. Logged when the choice changes, not on
+ * every resize. */
+static VkPresentModeKHR vk_pick_present_mode(const VkContext* c) {
+    const char* v = getenv("ZS1_VSYNC");
+    if (!v) return VK_PRESENT_MODE_FIFO_KHR;
+
+    VkPresentModeKHR modes[16];
+    uint32_t n = 16;
+    if (vkGetPhysicalDeviceSurfacePresentModesKHR(c->phys, c->surface, &n, modes) < 0) n = 0;
+    bool has_mailbox = false, has_immediate = false, has_relaxed = false;
+    for (uint32_t i = 0; i < n; i++) {
+        if (modes[i] == VK_PRESENT_MODE_MAILBOX_KHR)      has_mailbox   = true;
+        if (modes[i] == VK_PRESENT_MODE_IMMEDIATE_KHR)    has_immediate = true;
+        if (modes[i] == VK_PRESENT_MODE_FIFO_RELAXED_KHR) has_relaxed   = true;
+    }
+
+    int want = atoi(v);
+    VkPresentModeKHR pick = VK_PRESENT_MODE_FIFO_KHR;
+    const char* name = "FIFO";
+    if (want == 0) {
+        if (has_mailbox)        { pick = VK_PRESENT_MODE_MAILBOX_KHR;   name = "MAILBOX"; }
+        else if (has_immediate) { pick = VK_PRESENT_MODE_IMMEDIATE_KHR; name = "IMMEDIATE"; }
+    } else if (want == -1) {
+        if (has_relaxed)        { pick = VK_PRESENT_MODE_FIFO_RELAXED_KHR; name = "FIFO_RELAXED"; }
+    } else if (want != 1) {
+        LOG_RENDERER_WARN("[VK] ZS1_VSYNC=\"%s\" not recognised (want 0, 1 or -1); using FIFO", v);
+    }
+    static int logged = -1;
+    if (logged != (int)pick) {
+        logged = (int)pick;
+        LOG_RENDERER_INFO("[VK] ZS1_VSYNC=%s: present mode %s (mailbox %s, immediate %s, fifo_relaxed %s)",
+                          v, name, has_mailbox ? "yes" : "no", has_immediate ? "yes" : "no",
+                          has_relaxed ? "yes" : "no");
+    }
+    return pick;
+}
+
 bool vk_swapchain_create(VkContext* c, SDL_Window* window) {
     VkSurfaceCapabilitiesKHR caps;
     VK_CHECK(vkGetPhysicalDeviceSurfaceCapabilitiesKHR(c->phys, c->surface, &caps),
@@ -342,10 +389,10 @@ bool vk_swapchain_create(VkContext* c, SDL_Window* window) {
     c->swap_format     = chosen.format;
     c->swap_colorspace = chosen.colorSpace;
 
-    /* FIFO is the only mode guaranteed present, and it is also the right one:
-     * pacing here is done in software against the emulated refresh (main.c),
-     * and a mode that tears or spins would fight it. */
-    c->present_mode = VK_PRESENT_MODE_FIFO_KHR;
+    /* FIFO is the only mode guaranteed present, and it is the default: pacing
+     * is done in software against the audio ring or the emulated refresh
+     * (main.c). ZS1_VSYNC overrides it for an A/B, see vk_pick_present_mode. */
+    c->present_mode = vk_pick_present_mode(c);
 
     int w = 0, h = 0;
     SDL_GetWindowSizeInPixels(window, &w, &h);

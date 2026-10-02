@@ -6,6 +6,7 @@
  * components of this project that have other authors.
  */
 #include "cpu.h"
+#include "cpu_mem.h"
 #include "interconnect.h"
 #include "bios.h"
 #include "log.h"
@@ -147,6 +148,37 @@ static const char* get_bios_c_function_name(uint32_t func_num) {
     return "unknown";
 }
 
+/* Guest memory as the side channel reads it: a peek, not a bus access.
+ *
+ * Everything in this file is a host-side observer. It used to read the guest's
+ * strings and printf arguments with interconnect_load8/32(), which is the CPU's
+ * own load path: each byte charged a RAM load stall to the instruction that
+ * happened to be executing (so a BIOS printf made the emulated machine slower
+ * by three cycles per character of its format string), went through the read
+ * watchpoints (so a watch on a string buffer fired on the logger's read), and
+ * would have read an I/O register for real had a pointer ever landed there.
+ *
+ * This reads only memory that has no side effects (main RAM with its mirrors,
+ * the scratchpad, the BIOS ROM), decoded the way interconnect_load8() decodes
+ * them, and returns 0 for anything else, which ends a string. */
+static uint8_t bios_peek8(const Interconnect* inter, uint32_t vaddr) {
+    const uint32_t phys = bus_mask_region(vaddr);
+    if (phys < CPU_MEM_RAM_WINDOW_END)
+        return inter->ram->data[phys & (RAM_SIZE - 1)];
+    if (phys >= 0x1F800000u && phys < 0x1F800000u + SCRATCHPAD_SIZE && vaddr < 0xA0000000u)
+        return inter->scratchpad[phys - 0x1F800000u];
+    if (phys >= 0x1FC00000u && phys < 0x20000000u)
+        return inter->bios->data[(phys - 0x1FC00000u) & (BIOS_SIZE - 1)];
+    return 0;
+}
+
+static uint32_t bios_peek32(const Interconnect* inter, uint32_t vaddr) {
+    return (uint32_t)bios_peek8(inter, vaddr)
+         | ((uint32_t)bios_peek8(inter, vaddr + 1) << 8)
+         | ((uint32_t)bios_peek8(inter, vaddr + 2) << 16)
+         | ((uint32_t)bios_peek8(inter, vaddr + 3) << 24);
+}
+
 // Adds one character to the interconnect's TTY line buffer.
 // Flushes to stderr as a plain line on newline.
 // This is the syscall side-channel, not the DUART; interconnect_tty_char drops
@@ -183,7 +215,7 @@ static void capture_bios_write(Cpu* cpu) {
 
     if ((fd == 1 || fd == 2) && cpu->inter && len > 0 && len < 0x10000) {
         for (uint32_t i = 0; i < len; i++) {
-            char ch = (char)interconnect_load8(cpu->inter, buf + i);
+            char ch = (char)bios_peek8(cpu->inter, buf + i);
             tty_trace("write", &ch, 1);
             tty_add_char(cpu->inter, ch);
         }
@@ -210,7 +242,7 @@ static uint32_t printf_next_u32(PrintfArgs* pa) {
         default: {
             uint32_t addr = pa->sp + 16u + (uint32_t)pa->stack_slot * 4u;
             pa->stack_slot++;
-            return interconnect_load32(pa->cpu->inter, addr);
+            return bios_peek32(pa->cpu->inter, addr);
         }
     }
 }
@@ -228,7 +260,7 @@ static void capture_bios_printf(Cpu* cpu) {
     char fmtbuf[512];
     uint32_t flen = 0;
     for (; flen < sizeof(fmtbuf) - 1; flen++) {
-        uint8_t b = interconnect_load8(cpu->inter, fmt + flen);
+        uint8_t b = bios_peek8(cpu->inter, fmt + flen);
         if (b == 0) break;
         fmtbuf[flen] = (char)b;
     }
@@ -280,7 +312,7 @@ static void capture_bios_printf(Cpu* cpu) {
                 uint32_t si = 0;
                 if (ptr) {
                     for (; si < sizeof(strbuf) - 1; si++) {
-                        uint8_t b = interconnect_load8(cpu->inter, ptr + si);
+                        uint8_t b = bios_peek8(cpu->inter, ptr + si);
                         if (b == 0) break;
                         strbuf[si] = (char)b;
                     }
@@ -353,10 +385,10 @@ static void capture_bios_puts(Cpu* cpu) {
 
     if (str && cpu->inter) {
         { char t[128]; uint32_t k=0;
-          for (; k < sizeof(t)-1; k++) { uint8_t b=interconnect_load8(cpu->inter, str+k); if(!b) break; t[k]=(char)b; }
+          for (; k < sizeof(t)-1; k++) { uint8_t b=bios_peek8(cpu->inter, str+k); if(!b) break; t[k]=(char)b; }
           tty_trace("puts", t, k); }
         for (uint32_t i = 0; i < 512; i++) {
-            uint8_t b = interconnect_load8(cpu->inter, str + i);
+            uint8_t b = bios_peek8(cpu->inter, str + i);
             if (b == 0) break;
             tty_add_char(cpu->inter, (char)b);
         }
@@ -396,7 +428,7 @@ bool handle_a0_syscall(Cpu* cpu) {
         uint32_t name_ptr = cpu->regs[4];
         char name[64]; uint32_t i;
         for (i = 0; i < sizeof(name) - 1 && name_ptr; i++) {
-            uint8_t b = interconnect_load8(cpu->inter, name_ptr + i);
+            uint8_t b = bios_peek8(cpu->inter, name_ptr + i);
             if (b == 0) break;
             name[i] = (char)b;
         }
@@ -495,7 +527,7 @@ void handle_b0_syscall(Cpu* cpu) {
         uint32_t name_ptr = cpu->regs[4];
         char name[64]; uint32_t i;
         for (i = 0; i < sizeof(name) - 1 && name_ptr; i++) {
-            uint8_t b = interconnect_load8(cpu->inter, name_ptr + i);
+            uint8_t b = bios_peek8(cpu->inter, name_ptr + i);
             if (b == 0) break;
             name[i] = (char)b;
         }

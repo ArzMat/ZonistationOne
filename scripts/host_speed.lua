@@ -6,6 +6,11 @@
 -- ZS1_LOG_STDERR on costs more than the thing it measures — that mistake once
 -- produced a "85-95% of real time" figure that the emulator does not actually
 -- have when run normally.
+--
+-- Subscribes to the two notifications it counts and nothing else. Without the
+-- names, emu.on_event delivers every notification (one per GTE op, two per
+-- polygon, ...) into Lua, which made this probe slow down the emulator it was
+-- measuring; with them, the rest are dropped in C before Lua is entered.
 local vb, mbs, last = 0, 0, nil
 emu.on_event(function(name)
   if name == "mdec_macroblock" then mbs = mbs + 1; return end
@@ -24,5 +29,5 @@ emu.on_event(function(name)
       vb, mbs, host_s > 0 and emu_s * 100.0 / host_s or 0, prod, ring, drop))
   end
   last = { c = cyc, ms = ms, g = gen }
-end)
+end, "vblank", "mdec_macroblock")
 emu.log("[HOST SPEED] armed")

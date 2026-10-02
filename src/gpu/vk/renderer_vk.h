@@ -140,6 +140,16 @@ typedef struct {
     VkrBuffer       staging_buf[VK_FRAMES_IN_FLIGHT];
     uint32_t        frame_slot;
 
+    /* Readbacks (GP0(80h)/GP0(C0h), the inspector's whole-VRAM copy, the frame
+     * dump): one command buffer, one fence and one host-visible buffer for the
+     * life of the device. They were a command buffer allocated per call, a
+     * vkQueueWaitIdle, and a file-static buffer that outlived the device it
+     * was made from, so a Vulkan -> GL -> Vulkan switch handed the new device
+     * a dead VkBuffer. Here they go down with the device in vkr_destroy(). */
+    VkCommandBuffer rb_cmd;
+    VkFence         rb_fence;
+    VkrBuffer       readback_buf;
+
     /* ImGui's descriptor set for each image it draws, created once. */
     VkDescriptorSet imgui_scanout_set;
     VkDescriptorSet imgui_vram_set;

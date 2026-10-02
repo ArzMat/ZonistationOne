@@ -33,6 +33,7 @@ uint32_t mask_region(uint32_t addr) {
 }
 
 // --- Forward declarations ---
+static uint32_t ram_load_stall(void);
 static void interconnect_perform_dma(Interconnect* inter, uint32_t channel_index);
 static uint32_t dma_get_transfer_size_words(DmaChannel* ch);
 
@@ -112,6 +113,11 @@ void bus_hw_tables_init(void) {
     HW_SET(0x1F801820, 0x1F801830, hw_mdec_read,      hw_mdec_write);
     // SPU      0x1F801C00-0x1F801E7F  (indices 0xC0-0xE7)
     HW_SET(0x1F801C00, 0x1F801E80, hw_spu_read,       hw_spu_write);
+
+    /* Settle the RAM load stall (and its ZS1_RAM_LOAD_STALL override) now,
+     * before the first instruction, so g_bus_ram_load_stall holds the final
+     * value for the CPU's RAM fast path (cpu_mem.h) from the very first load. */
+    (void)ram_load_stall();
 }
 
 // =============================================================================
@@ -531,6 +537,13 @@ static inline void sp_store16(Interconnect* i, uint32_t off, uint16_t v) {
  * plus nothing. The default stays 3.
  *
  * Read once and cached; the load path is the hottest in the emulator. */
+/* The same figure, exported for the CPU's own RAM fast path (cpu_mem.h), which
+ * charges it inline instead of calling in here. ram_load_stall() is the only
+ * writer, and bus_hw_tables_init() calls it before the CPU runs, so the two can
+ * never disagree. The DMA loops do not use it: they still go through
+ * interconnect_load32() (see cpu_mem.h for why). */
+uint32_t g_bus_ram_load_stall = RAM_LOAD_STALL;
+
 static uint32_t ram_load_stall(void) {
     static int cached = -1;
     if (cached < 0) {
@@ -539,6 +552,7 @@ static uint32_t ram_load_stall(void) {
         if (v < 0)  v = 0;
         if (v > 64) v = 64;      /* absurd values are a typo, not an intent */
         cached = (int)v;
+        g_bus_ram_load_stall = (uint32_t)v;
         if (s) LOG_INTERCONNECT_INFO("[BUS] ZS1_RAM_LOAD_STALL=%d extra cycles per RAM load "
                                      "(default %u)", cached, (unsigned)RAM_LOAD_STALL);
     }

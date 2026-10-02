@@ -202,6 +202,14 @@ uint16_t timer_read16(Timers* timers, int timer_index, uint32_t offset) {
             return t->counter;
         case TMR_REG_MODE: // 0x4: Mode Register
             {
+                /* Catch up first, as the counter read does. The reached flags
+                 * (bits 11-12) say whether the counter has hit its target or
+                 * FFFFh since the last read (psx-spx ps1/system/timers.md:50-51), and
+                 * that is a question about now. Without this they were only as
+                 * current as the last timer event, which can sit up to one
+                 * timer tick (the rate, in CPU cycles) past the boundary; a
+                 * counter read in that window already saw the wrap. */
+                timers_catch_up_one(timers, timer_index);
                 // Update read-only status bits before returning mode value
                 uint16_t mode = t->mode & ~0x1F00; // Clear status bits 12:10
                 mode |= (uint16_t)t->reached_target_flag << 11;

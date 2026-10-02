@@ -359,7 +359,17 @@ static void spu_generate_one_sample(Spu* spu, struct Interconnect* inter, int16_
     rev_in_l = clamp16(rev_in_l);
     rev_in_r = clamp16(rev_in_r);
 
-    /* CD audio mixing through SPU — separately routable to the reverb.
+    /* SPUCNT.14 = 0 mutes the SPU's own sound, "(Don't care for CD Audio)"
+     * (psx-spx spu/soundprocessingunitspu.md:631): the voices, dry and into the
+     * reverb, go silent here, before the CD input joins the mix. It used to be
+     * applied as a zero main volume at the very end, which took the CD (and an
+     * XA cutscene's speech with it) down as well. */
+    if (spu->muted) {
+        mix_l = mix_r = 0;
+        rev_in_l = rev_in_r = 0;
+    }
+
+    /* CD audio mixing through SPU, separately routable to the reverb.
      *
      * ZS1_SPU_NO_CDAUDIO=1 drops the CD/XA contribution, the counterpart to
      * ZS1_SPU_NO_REVERB. In a scene where XA streams at the full sample rate and
@@ -411,9 +421,21 @@ static void spu_generate_one_sample(Spu* spu, struct Interconnect* inter, int16_
         mix_r = clamp16(mix_r + rev_r);
     }
 
-    /* Apply main volume — use main_vol_left/right_cur (already << 1 scaled, 0..32766 for full vol) */
-    int32_t mv_l = spu->muted ? 0 : spu->main_vol_left_cur;
-    int32_t mv_r = spu->muted ? 0 : spu->main_vol_right_cur;
+    /* Main volume. MVOLL/MVOLR have the voice volume format (:405-406), so in
+     * sweep mode (bit15=1) the level moves once per sample (:414-432) and
+     * MVOLXL/MVOLXR read it back (:526-531). Only the fixed mode used to do
+     * anything: a scene that set 0 and then faded in with a sweep stayed silent
+     * throughout, XA included, and a sweep fade-out never lowered anything. The
+     * level applies after voices, reverb and CD are summed. Mute is no longer
+     * folded in here; see SPUCNT.14 above. */
+    if (spu->main_vol_left & 0x8000)
+        spu->main_vol_left_cur = spu_sweep_tick(spu->main_vol_left, (int)spu->main_vol_left_cur,
+                                                &spu->main_vol_sweep_count[0]);
+    if (spu->main_vol_right & 0x8000)
+        spu->main_vol_right_cur = spu_sweep_tick(spu->main_vol_right, (int)spu->main_vol_right_cur,
+                                                 &spu->main_vol_sweep_count[1]);
+    int32_t mv_l = spu->main_vol_left_cur;
+    int32_t mv_r = spu->main_vol_right_cur;
 
     int32_t final_l = clamp16((mix_l * mv_l) >> 15);
     int32_t final_r = clamp16((mix_r * mv_r) >> 15);

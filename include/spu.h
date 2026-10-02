@@ -185,8 +185,8 @@ typedef struct SpuVoice {
     /* Current L/R volume (signed 16-bit range, updated by sweep each sample) */
     int vol_left;
     int vol_right;
-    int vol_left_count;   // sweep counter for left channel
-    int vol_right_count;  // sweep counter for right channel
+    int32_t vol_left_count;   /* sweep step counter, left (spu_sweep_tick) */
+    int32_t vol_right_count;  /* sweep step counter, right */
 
     /* Pitch stepping */
     int sinc_unused;                /* was the pre-multiplied step. The pitch
@@ -204,12 +204,18 @@ typedef struct SpuVoice {
     int spos;                       /* 16-bit fractional position (0-0xFFFF between steps) */
 
     /* ADPCM decode state */
-    uint32_t curr_addr;             /* current block byte address in SPU RAM */
-    uint32_t start_addr;            /* start byte address */
-    uint32_t loop_addr;             /* loop byte address (set by ADPCM flag 4) */
-    bool     loop_addr_set;         /* loop_addr is valid */
-    bool     ignore_loop;           /* ignore flag-4 loop point (external set) */
-    bool     reach_end;             /* one-shot end reached */
+    uint32_t curr_addr;             /* byte address of the next block to read */
+    uint32_t start_addr;            /* start byte address (copy taken at Key On) */
+    /* loop_addr, loop_addr_set and ignore_loop are no longer read. The loop
+     * point is repeat_address itself, as the hardware keeps it
+     * (soundprocessingunitspu.md:133-138). The three stay so sizeof(Spu) does
+     * not move for them; the savestate stores the SPU as one sized span. */
+    uint32_t loop_addr;             /* unused */
+    bool     loop_addr_set;         /* unused */
+    bool     ignore_loop;           /* unused */
+    /* A Code 1 block (End+Mute) was just read: Release and envelope 0 are owed
+     * once that block has been played (see voice_fetch_block). */
+    bool     reach_end;
     int      SBPos;                 /* 0-27: current sample index; 28: triggers decode */
     int      SB[28];                /* decoded PCM samples for current block */
     int      s_1, s_2;             /* ADPCM predictor carry */
@@ -233,7 +239,9 @@ typedef struct SpuVoice {
     int EnvelopeVolF;               /* fractional tick counter */
 
     /* Channel flags */
-    bool on;                        /* voice active */
+    bool on;                        /* envelope running, voice in the mix. A voice
+                                     * with on=false is silent but still reads
+                                     * SPU RAM (spu_voice_get_sample) */
     bool stop;                      /* key-off pending: transition to Release */
     bool endx_mask;                 /* end-of-block flag (written to ENDX register) */
 
@@ -301,13 +309,17 @@ typedef struct Spu {
     int16_t  reverb_ds_buf[2][128];  /* downsample input */
     int16_t  reverb_us_buf[2][64];   /* upsample output */
     int32_t  reverb_resample_pos;
-    int16_t  last_reverb_input[2];
-    int32_t  last_reverb_output[2];
+    int16_t  last_reverb_input[2];   /* unused */
+    /* Step counters of the main volume sweeps, left and right. This slot was
+     * `last_reverb_output[2]`, which nothing ever read or wrote, so the sweep
+     * gets its state without changing the layout of the saved SPU span. */
+    int32_t  main_vol_sweep_count[2];
 
-    /* Audio output (main sweep) */
+    /* Audio output: the current main volume, which a sweep moves once per
+     * sample and MVOLXL/MVOLXR (1F801DB8h/DBAh) read back. */
     int32_t  main_vol_left_cur;
     int32_t  main_vol_right_cur;
-    bool     muted;
+    bool     muted;                  /* SPUCNT.14 = 0: voices muted, CD not */
 
     /* CD audio frame mixing */
     int16_t  cd_audio_left;
@@ -347,6 +359,17 @@ typedef struct Spu {
     int32_t  peak_level_left;   /* peak level for audio meter */
     int32_t  peak_level_right;
 
+    /* Manual-write data FIFO (1F801DA8h, "max 32 halfwords",
+     * soundprocessingunitspu.md:681-685). The documented upload fills it while
+     * the transfer mode is Stop and only then selects Manual Write (:715-721),
+     * which is when the halfwords go into SPU RAM at the transfer address.
+     *
+     * Appended at the very end on purpose: this is new state, so sizeof(Spu)
+     * grows, and a T_SPU section saved before it is now an exact prefix of the
+     * struct rather than a reshuffle of it. */
+    uint16_t manual_fifo[32];
+    uint8_t  manual_fifo_count;
+
 } Spu;
 
 /* --- Public API --- */
@@ -369,9 +392,14 @@ void     spu_dma_read_halfwords(Spu* spu, struct Interconnect* inter, uint16_t* 
 bool     spu_dma_write_request(Spu* spu);
 bool     spu_dma_read_request(Spu* spu);
 
-/* IRQ */
+/* IRQ9. The IRQ address traps an SPU RAM *access*: a voice reading the block
+ * that holds it, a transfer or a capture write touching it
+ * (soundprocessingunitspu.md:823-852). Writing IRQA or TSA is not an access
+ * and raises nothing. The flag is acknowledged only by SPUCNT.6 = 0 (:635). */
 bool     spu_check_irq(Spu* spu, struct Interconnect* inter, uint32_t address);
-void     spu_update_irq_addr(Spu* spu, struct Interconnect* inter);
+bool     spu_check_irq_range(Spu* spu, struct Interconnect* inter,
+                             uint32_t start, uint32_t len);
+void     spu_irq_acknowledge(Spu* spu, struct Interconnect* inter);
 
 /* Key on/off processing (called once per sample batch) */
 void     spu_process_key_on_off(Spu* spu);
@@ -379,13 +407,22 @@ void     spu_process_key_on_off(Spu* spu);
 /* SPU RAM transfer (manual mode) */
 void     spu_transfer_write(Spu* spu, struct Interconnect* inter, uint16_t value);
 uint16_t spu_transfer_read(Spu* spu, struct Interconnect* inter);
+/* Data FIFO written while the transfer mode is Stop, and its flush into SPU RAM
+ * once Manual Write is selected (soundprocessingunitspu.md:715-721). */
+void     spu_manual_fifo_push(Spu* spu, uint16_t value);
+void     spu_manual_fifo_flush(Spu* spu, struct Interconnect* inter);
 
 /* SPU control register handling */
-void     spu_set_control(Spu* spu, uint16_t value);
+void     spu_set_control(Spu* spu, struct Interconnect* inter, uint16_t value);
 
 /* Voice sample generation — returns ADSR-mixed sample (pre-L/R volume) */
 int32_t  spu_voice_get_sample(Spu* spu, struct Interconnect* inter, int voice_idx);
 void     spu_voice_sweep_tick(SpuVoice* voice);
+/* One 44.1 kHz step of a sweep-mode volume (bit15=1 in `reg`): voice VOLL/VOLR
+ * and main MVOLL/MVOLR share the format (soundprocessingunitspu.md:405-435) and
+ * the envelope operation at :447-482. Returns the new level. */
+int      spu_sweep_tick(uint16_t reg, int level, int32_t* counter);
+
 
 /* ADSR mix — called from spu_voice.c; returns 0-1023 */
 int      spu_adsr_mix(SpuVoice* voice);

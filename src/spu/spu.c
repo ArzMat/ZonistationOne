@@ -75,7 +75,12 @@ void spu_process_key_on_off(Spu* spu) {
         }
     }
 
-    /* Process key on — pcsx-redux 1:1 init */
+    /* Process key on, after the pcsx-redux init. Key On copies the start
+     * address to the current address (soundprocessingunitspu.md:131) and leaves
+     * the repeat address alone: only a Loop Start flag or a write changes it
+     * (:133-147). Resetting the loop state here threw away a repeat address the
+     * game had written before Key On, which is the usual way to loop a ring
+     * that carries no Loop Start flag of its own. */
     for (int v = 0; v < NUM_VOICES; v++) {
         if (spu->key_on & (1u << v)) {
             SpuVoice* voice = &spu->voices[v];
@@ -86,8 +91,6 @@ void spu_process_key_on_off(Spu* spu) {
             voice->s_2          = 0;
             memset(voice->gauss_ring, 0, sizeof(voice->gauss_ring));
             voice->gpos         = 0;
-            voice->loop_addr_set = false;
-            voice->ignore_loop  = false;
             voice->reach_end    = false;
             voice->curr_addr    = (uint32_t)voice->start_address * 8;
             voice->start_addr   = voice->curr_addr;
@@ -117,18 +120,21 @@ void spu_process_key_on_off(Spu* spu) {
  * Control Register
  * ========================================================================= */
 
-void spu_set_control(Spu* spu, uint16_t value) {
+void spu_set_control(Spu* spu, struct Interconnect* inter, uint16_t value) {
     uint16_t old = spu->control;
     spu->control = value;
 
-    /* Mute */
+    /* Mute: SPUCNT.14 = 0 silences the voices, not the CD input
+     * (soundprocessingunitspu.md:631, "Don't care for CD Audio"); applied in
+     * spu_generate_one_sample. */
     spu->muted = !(value & SPU_CTRL_MUTE);
 
-    /* IRQ enable change */
-    if ((old & SPU_CTRL_IRQ9_ENABLE) && !(value & SPU_CTRL_IRQ9_ENABLE)) {
-        spu->irq9_flag = false;
-        spu->status &= ~SPU_STATUS_IRQ9_FLAG;
-    }
+    /* IRQ9 Enable = 0 is also the acknowledge: "(0=Disabled/Acknowledge,
+     * 1=Enabled)" (:635). It is the only thing that clears the flag in SPUSTAT.6
+     * (:655) and takes the SPU's request off the interrupt line; writing I_STAT
+     * does neither (src/core/bus.c, psx-spx system/interrupts.md:34-36). */
+    if (!(value & SPU_CTRL_IRQ9_ENABLE))
+        spu_irq_acknowledge(spu, inter);
 
     /* SPU disable: force all voices off */
     if (!(value & SPU_CTRL_ENABLE)) {
@@ -149,6 +155,11 @@ void spu_set_control(Spu* spu, uint16_t value) {
     spu->status = (uint16_t)((spu->status & ~(SPU_STATUS_MODE | SPU_STATUS_DMA_REQUEST))
                              | (value & SPU_STATUS_MODE)
                              | ((value & (1u << 5)) ? SPU_STATUS_DMA_REQUEST : 0u));
+
+    /* Selecting Manual Write is what sends the halfwords queued in the data
+     * FIFO while the mode was Stop into SPU RAM (:715-721). */
+    if (((value >> 4) & 0x03) == TRANSFER_MANUAL_WRITE && spu->manual_fifo_count)
+        spu_manual_fifo_flush(spu, inter);
 
     if (value != old) {
         LOG_SPU_DEBUG("[SPU] Control=0x%04X (enable=%d, muted=%d, irq=%d, mode=%d)",
@@ -310,10 +321,13 @@ static void voice_write_reg(Spu* spu, int voice, int sub, uint16_t value) {
             v->adsr_volume = (int16_t)value;
             break;
         case 0x0E:
+            /* A write just sets the repeat address (soundprocessingunitspu.md:
+             * 142-147). It used to also latch "ignore Loop Start flags" until the
+             * next Key On, so a stream that wrote LSAX once and then kept
+             * rewriting blocks with Loop Start flags looped back to the stale
+             * address: the same chunk again. Nothing in the documentation
+             * describes such a latch. */
             v->repeat_address = value;
-            v->loop_addr      = (uint32_t)value * 8;
-            v->loop_addr_set  = true;
-            v->ignore_loop    = true;  /* external write overrides ADPCM flag-4 */
             break;
     }
 }
@@ -341,7 +355,8 @@ void spu_write16(struct Interconnect* inter, uint32_t addr, uint16_t value) {
     switch (reg) {
         case SPU_REG_MVOL_L:
             spu->main_vol_left = value;
-            /* Same rule as the voice volumes: only fixed mode sets the level. */
+            /* Same rule as the voice volumes: only fixed mode sets the level; a
+             * sweep moves it from there, once per sample (spu_mixing.c). */
             if (!(value & 0x8000))
                 spu->main_vol_left_cur = (int32_t)(int16_t)((value & 0x7FFF) << 1);
             LOG_SPU_DEBUG("[SPU] Main Vol L <- 0x%04X (working=%d)", value, spu->main_vol_left_cur);
@@ -372,27 +387,36 @@ void spu_write16(struct Interconnect* inter, uint32_t addr, uint16_t value) {
             spu->reverb_base = value;
             spu->reverb_current_addr = (uint32_t)spu->reverb_base * 4u;
             break;
+        /* Writing IRQA or TSA only stores an address. The IRQ is raised by an
+         * access to SPU RAM at that address (soundprocessingunitspu.md:823-852),
+         * and a register write is not one; both used to fire it on the spot when
+         * a voice or the transfer pointer already sat there. */
         case SPU_REG_IRQ_ADDR:
             spu->irq_addr = value;
-            spu_update_irq_addr(spu, inter);
             break;
         case SPU_REG_TRANSFER_ADDR:
             spu->transfer_addr_reg = value;
             spu->transfer_addr = (uint32_t)value * 8;
-            spu_check_irq(spu, inter, spu->transfer_addr);
             break;
         case 0x1AC: /* SPU_DATA_TRANSFER_CONTROL — ignore write */ break;
         case SPU_REG_TRANSFER_DATA: {
+            /* "Data (max 32 halfwords)" (:683). The documented upload writes it
+             * while the mode is Stop and selects Manual Write afterwards
+             * (:715-721), so in Stop the halfword waits in the FIFO; it used to
+             * be dropped. In Manual Write (and DMA write) it goes straight to RAM
+             * as before: that is the multi-block case, where the mode is already
+             * Manual Write when the next block's FIFO writes arrive (:722-727). */
             int mode = (spu->control >> 4) & 0x03;
             if (mode == TRANSFER_MANUAL_WRITE || mode == TRANSFER_DMA_WRITE) {
                 spu_transfer_write(spu, inter, value);
-            } else if (mode == TRANSFER_DMA_READ) {
-                /* Write to FIFO during DMA read */
+            } else if (mode == TRANSFER_STOPPED) {
+                spu_manual_fifo_push(spu, value);
             }
+            /* DMA read: nothing documented, ignored as before. */
             break;
         }
         case SPU_REG_CONTROL:
-            spu_set_control(spu, value);
+            spu_set_control(spu, inter, value);
             break;
         case SPU_REG_CD_VOL_L: spu->cd_vol_left = (int16_t)value; break;
         case SPU_REG_CD_VOL_R: spu->cd_vol_right = (int16_t)value; break;

@@ -26,6 +26,7 @@
  */
 
 #include "renderer_vk.h"
+#include "../renderer_isolate.h"
 #include "log.h"
 #include "frame_events.h"
 #include "vk_imgui.h"
@@ -798,9 +799,20 @@ static void vkr_stage_vertex(VkRenderer* r, const RendererPosition* p, const Ren
     v->clut = clut; v->tpage = tpage;
 }
 
+/* As glr_isolate_if_needed: a primitive that may read what its own draw call
+ * writes is closed into a batch of its own (renderer_isolate.h). */
+static void vkr_isolate_if_needed(VkRenderer* r, bool textured, uint16_t tpage, uint16_t clut) {
+    const int16_t* a = r->draw_area;
+    const bool own = zs1_prim_reads_drawn_area(r->mask_test_enabled, textured && r->texture_enabled,
+                                               tpage, clut, a[0], a[1], a[2], a[3]);
+    if (own || r->last_prim_isolated) VKR_FLUSH(r);
+    r->last_prim_isolated = own;
+}
+
 void vkr_push_triangle(VkRenderer* r, RendererPosition p[3], RendererColor c[3],
                        RendererTexCoord t[3], uint16_t clut, uint16_t tpage) {
     if (!r->initialized) return;
+    vkr_isolate_if_needed(r, t != NULL, tpage, clut);
     if (r->pending_is_line) VKR_FLUSH(r);
     r->pending_is_line = false;
     if (r->vertex_count + 3 > VERTEX_BUFFER_LEN) vkr_record_batch(r, false);
@@ -810,6 +822,7 @@ void vkr_push_triangle(VkRenderer* r, RendererPosition p[3], RendererColor c[3],
 void vkr_push_quad(VkRenderer* r, RendererPosition p[4], RendererColor c[4],
                    RendererTexCoord t[4], uint16_t clut, uint16_t tpage) {
     if (!r->initialized) return;
+    vkr_isolate_if_needed(r, t != NULL, tpage, clut);
     if (r->pending_is_line) VKR_FLUSH(r);
     r->pending_is_line = false;
     if (r->vertex_count + 6 > VERTEX_BUFFER_LEN) vkr_record_batch(r, false);
@@ -825,6 +838,7 @@ void vkr_push_quad(VkRenderer* r, RendererPosition p[4], RendererColor c[4],
 
 void vkr_push_line(VkRenderer* r, RendererPosition p[2], RendererColor c[2]) {
     if (!r->initialized) return;
+    vkr_isolate_if_needed(r, false, 0, 0);
     if (!r->pending_is_line) VKR_FLUSH(r);
     r->pending_is_line = true;
     if (r->vertex_count + 2 > VERTEX_BUFFER_LEN) vkr_record_batch(r, true);
@@ -907,6 +921,8 @@ void vkr_set_draw_offset(VkRenderer* r, int16_t x, int16_t y) {
 }
 
 void vkr_set_drawing_area(VkRenderer* r, uint16_t l, uint16_t t, uint16_t rt, uint16_t b) {
+    r->draw_area[0] = (int16_t)l;  r->draw_area[1] = (int16_t)t;
+    r->draw_area[2] = (int16_t)rt; r->draw_area[3] = (int16_t)b;
     /* No Y flip, for the same reason the vertex shader has none: VRAM row N is
      * image row N in both APIs. GL does not flip here either. */
     int w = (int)rt - (int)l + 1;

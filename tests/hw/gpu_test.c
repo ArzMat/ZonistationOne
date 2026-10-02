@@ -84,6 +84,26 @@ static void test_upload_wraps_at_right_edge(void) {
     check("upload_wraps_at_right_edge", got == 0x01040508u, got, 0x01040508u);
 }
 
+/* Two overlapping rectangles drawn with GP0(E6h) = 3 (set the mask bit, and
+ * skip pixels whose mask bit is set): the second must leave the first one's
+ * pixels alone (psx-spx gpu/rendering-attributes.md:162-169). Same state, so
+ * a renderer that merges them into one draw call has to keep them apart. */
+static void test_mask_test_between_overlapping_primitives(void) {
+    gpu_set_drawing_area(0, 0, 1023, 511);
+    gp0(0xE6000003u);
+    gpu_rect(0x0000FFu, 800, 300, 8, 1);           /* red, sets bit 15 */
+    gpu_rect(0xFF0000u, 804, 300, 8, 1);           /* blue, must skip 804..807 */
+    gp0(0xE6000000u);
+    uint16_t px[12];
+    int ok = gpu_read_rect(800, 300, 12, 1, px);
+    uint32_t bad = 0, first = 0, want_first = 0;
+    for (int i = 0; i < 12 && ok; i++) {
+        uint16_t want = (uint16_t)(0x8000u | (i < 8 ? RED_15 : BLUE_15));
+        if (px[i] != want) { if (!bad) { first = px[i]; want_first = want; } bad++; }
+    }
+    check("mask_test_between_overlapping_primitives", ok && !bad, ok ? first : 0xDEADDEADu, want_first);
+}
+
 int main(void) {
     suite_begin("gpu");
     GP1 = 0x00000000u;                             /* GP1(00h) reset */
@@ -91,6 +111,7 @@ int main(void) {
     test_fill_outside_drawing_area();
     test_copy_of_rasterised_pixels();
     test_upload_wraps_at_right_edge();
+    test_mask_test_between_overlapping_primitives();
     suite_end();
     return 0;
 }

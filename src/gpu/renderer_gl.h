@@ -104,6 +104,9 @@ typedef struct {
     int16_t  cached_offset_x, cached_offset_y;
     int32_t  cached_tex_window[4];  /* and_x, and_y, or_x, or_y */
     int32_t  cached_scissor[4];     /* gl_x, gl_y, clip_w, clip_h (GL coords) */
+    int16_t  draw_area[4];          /* left, top, right, bottom as GP0(E3h)/(E4h) gave them */
+    bool     last_prim_isolated;    /* the primitive just pushed must not be extended
+                                     * (renderer_isolate.h) */
 
     /* Display region — cropped from CRTC state, passed to GPU thread blit */
     uint16_t display_x, display_y, display_w, display_h;

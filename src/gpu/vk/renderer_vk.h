@@ -169,6 +169,8 @@ typedef struct {
     int16_t    cached_offset_x, cached_offset_y;
     int32_t    cached_tex_window[4];
     int32_t    cached_scissor[4];
+    int16_t    draw_area[4];        /* left, top, right, bottom as GP0(E3h)/(E4h) gave them */
+    bool       last_prim_isolated;  /* see renderer_isolate.h */
     uint16_t   display_x, display_y, display_w, display_h;
     bool       display_depth24, display_blank;
     VramViewParams vram_view;

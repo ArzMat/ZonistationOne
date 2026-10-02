@@ -6,6 +6,7 @@
  * components of this project that have other authors.
  */
 #include "renderer_gl.h"
+#include "renderer_isolate.h"
 #include "log.h"
 #include "lua_debug.h"
 #include "frame_events.h"
@@ -1056,12 +1057,26 @@ bool glr_init(GlRenderer* renderer) {
     return true;
 }
 
+/* A primitive that may read what its own draw call writes gets a call of its
+ * own: the pending vertices are closed into a batch before it, and the next
+ * push closes it in turn (renderer_isolate.h). */
+static void glr_isolate_if_needed(GlRenderer* renderer, bool textured, uint16_t tpage, uint16_t clut) {
+    const int16_t* a = renderer->draw_area;
+    const bool own = zs1_prim_reads_drawn_area(renderer->mask_test_enabled,
+                                               textured && renderer->texture_enabled,
+                                               tpage, clut, a[0], a[1], a[2], a[3]);
+    if ((own || renderer->last_prim_isolated) && renderer->vertex_count > 0)
+        glr_draw(renderer);
+    renderer->last_prim_isolated = own;
+}
+
 // Buffers a triangle's vertex data
 void glr_push_triangle(GlRenderer* renderer, RendererPosition pos[3], RendererColor col[3], RendererTexCoord tex[3], uint16_t clut, uint16_t tpage) {
     if (!renderer->initialized) {
         LOG_RENDERER_ERROR("[RENDERER] GlRenderer Error: push_triangle called before initialization.");
         return;
     }
+    glr_isolate_if_needed(renderer, tex != NULL, tpage, clut);
 
     if (renderer->vertex_count + 3 > VERTEX_BUFFER_LEN) {
         LOG_RENDERER_DEBUG("[RENDERER] GlRenderer: Vertex buffer full (%u verts), forcing draw before push_triangle.", renderer->vertex_count);
@@ -1095,6 +1110,7 @@ void glr_push_quad(GlRenderer* renderer, RendererPosition pos[4], RendererColor 
         LOG_RENDERER_ERROR("[RENDERER] GlRenderer Error: push_quad called before initialization.");
         return;
      }
+     glr_isolate_if_needed(renderer, tex != NULL, tpage, clut);
 
      if (renderer->vertex_count + 6 > VERTEX_BUFFER_LEN) {
         LOG_RENDERER_DEBUG("[RENDERER] GlRenderer Info: Vertex buffer full (%u verts), forcing draw before push_quad.", renderer->vertex_count);
@@ -1735,6 +1751,8 @@ void glr_set_drawing_area(GlRenderer* renderer, uint16_t left, uint16_t top,
                                 uint16_t right, uint16_t bottom)
 {
     if (!renderer->initialized) return;
+    renderer->draw_area[0] = (int16_t)left;  renderer->draw_area[1] = (int16_t)top;
+    renderer->draw_area[2] = (int16_t)right; renderer->draw_area[3] = (int16_t)bottom;
 
     float sw = renderer->screen_width  ? renderer->screen_width  : 1024.0f;
     float sh = renderer->screen_height ? renderer->screen_height : 512.0f;
@@ -1865,6 +1883,7 @@ void glr_push_line(GlRenderer* renderer, RendererPosition pos[2], RendererColor 
                 && c->dither_enabled    == renderer->dither_enabled
                 && c->set_mask_enabled  == renderer->set_mask_enabled
                 && c->mask_test_enabled == renderer->mask_test_enabled
+                && !renderer->mask_test_enabled   /* reads the destination: renderer_isolate.h */
                 && c->offset_x == renderer->cached_offset_x
                 && c->offset_y == renderer->cached_offset_y
                 && memcmp(c->scissor, renderer->cached_scissor, sizeof(c->scissor)) == 0)

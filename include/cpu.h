@@ -195,7 +195,16 @@ typedef struct Cpu {
     uint32_t gte_completion_tick;    // cycle when pending GTE op finishes (for MFC2/CFC2/next-op stall)
 
     // --- Execution Trace Ring Buffer ---
-#define EXEC_TRACE_SIZE 8192  // must be power-of-2
+    /* 1024 entries, 8 KB. It was 8192 (64 KB), written on every instruction:
+     * two stores walking a 64 KB window, which is larger than the L1 data
+     * cache of the cores this runs on, so every sixteen instructions it pulled
+     * two fresh lines in and pushed out the register file, the instruction
+     * cache model, the scratchpad and the hot Interconnect fields. Its readers
+     * are the Exec Trace tab and the crash dumps, which want the last few
+     * hundred instructions before a fault, not the last eight thousand.
+     * Changes sizeof(Cpu), which savestate.c writes raw as T_CPU: a state saved
+     * by an earlier build is refused with a clean "different layout" error. */
+#define EXEC_TRACE_SIZE 1024  // must be power-of-2
     uint32_t exec_trace_pc[EXEC_TRACE_SIZE];
     uint32_t exec_trace_instr[EXEC_TRACE_SIZE];
     uint32_t exec_trace_head;   // next write index
@@ -239,6 +248,15 @@ void cpu_init(Cpu* cpu, Interconnect* inter);
  */
 void cpu_run_next_instruction(Cpu* cpu);
 
+/**
+ * @brief Runs instructions until the field ends (inter->frame_complete), the
+ * debugger pauses, or cpu_cycle_counter - start_cycle reaches cap_cycles.
+ * Checks the three conditions after every instruction, exactly as
+ * system_run_frame() did around cpu_run_next_instruction().
+ * @return false if it stopped because the debugger paused.
+ */
+bool cpu_run_frame(Cpu* cpu, uint32_t start_cycle, uint32_t cap_cycles);
+
 // Dump last EXEC_TRACE_SIZE instructions to file (call on shutdown/crash).
 void cpu_dump_exec_trace(const Cpu* cpu, const char* path);
 
@@ -265,24 +283,44 @@ void handle_c0_syscall(Cpu* cpu);
 
 
 // --- Register Access ---
-/**
- * @brief Reads the value of a General Purpose Register (GPR) from the input set.
- * Handles reads from $zero (always returns 0).
- * @param cpu Pointer to the Cpu state.
- * @param index The index (0-31) of the register to read.
- * @return The 32-bit value of the register.
- */
-uint32_t cpu_reg(Cpu* cpu, RegisterIndex index);
+/* Both are static inline here rather than out of line in cpu_registers.c.
+ *
+ * They are called two or three times by almost every instruction, and a perf
+ * profile put cpu_reg plus mask_region at 1.90% of all samples in call
+ * overhead alone (Makefile, LTO note). Out of line they were only inlined when
+ * LTO happened to be on; here they always are.
+ *
+ * The old `index >= 32` guard (with a logger call on the error path) is gone:
+ * every caller passes a 5-bit instruction field (instr_s/_t/_d) or a constant,
+ * so the index cannot exceed 31 and the guard was a dead compare-and-branch on
+ * the hottest path. regs[] is exactly 32 entries. */
 
 /**
- * @brief Writes a value to a General Purpose Register (GPR).
- * Ignores writes to $zero (index 0), ensuring it remains 0, and cancels a load
- * still in flight for the same register — that load is the earlier write.
- * @param cpu Pointer to the Cpu state.
- * @param index The index (0-31) of the register to write.
- * @param value The 32-bit value to write.
+ * @brief Reads a General Purpose Register. $zero reads 0 because regs[0] is
+ * never written (cpu_set_reg drops R0 writes).
+ * @param index 0-31, from a 5-bit instruction field.
  */
-void cpu_set_reg(Cpu* cpu, RegisterIndex index, uint32_t value);
+static inline uint32_t cpu_reg(const Cpu* cpu, RegisterIndex index) {
+    return cpu->regs[index];
+}
+
+/**
+ * @brief Writes a General Purpose Register.
+ * Ignores writes to $zero (index 0), ensuring it remains 0, and cancels a load
+ * still in flight for the same register: that load is the earlier write. Its
+ * data "isn't updated until the next opcode has completed"
+ * (psx-spx-docs/docs/cpuspecifications.md:172-174), and this write belongs to
+ * that next opcode, so it is the later one and stands. Without the cancel the
+ * load would land afterwards and quietly undo it.
+ * @param index 0-31, from a 5-bit instruction field.
+ */
+static inline void cpu_set_reg(Cpu* cpu, RegisterIndex index, uint32_t value) {
+    if (index != REG_ZERO) {
+        cpu->regs[index] = value;
+        if (index == cpu->delay_load_reg)
+            cpu->delay_load_reg = REG_ZERO;
+    }
+}
 
 /**
  * @brief Lands any in-flight load immediately, for exception entry.

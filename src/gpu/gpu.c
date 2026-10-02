@@ -393,60 +393,74 @@ static void gp1_display_mode(Gpu* gpu, uint32_t value) {
 // ---------------------------------------------------------------------------
 // GP1(0x10–0x1F): GetGPUInfo — stores result into gpu_info_latch for GPUREAD
 // ---------------------------------------------------------------------------
+/* The register indices, as a v2 GPU answers them (psx-spx
+ * gpu/display-control-commands-gp1.md:191-203; gpu/versions.md:11-14 for the
+ * v2 column), which is the GPU this core reports itself as through index 7:
+ *   00h-01h  nothing (the latch keeps its old value)
+ *   02h      texture window, GP0(E2h)          20 bits, MSBs = nothing
+ *   03h      drawing area top left, GP0(E3h)   20 bits, MSBs = nothing
+ *   04h      drawing area bottom right, GP0(E4h) 20 bits, MSBs = nothing
+ *   05h      drawing offset, GP0(E5h)          22 bits
+ *   06h      nothing
+ *   07h      GPU version: 2
+ *   08h      00000000h
+ *   09h-0Fh  nothing
+ *   10h-FFFFFFh mirrors of 00h..0Fh
+ * "Nothing" is defined there as "old value in GP0.read remains unchanged", so
+ * for 02h-04h the bits above the 20 returned ones are kept from the old latch.
+ *
+ * This used to answer one index late (02h gave the texture page, 03h the
+ * texture window, 04h the top left, 05h the bottom right, 06h the offset) and
+ * to zero the latch for the indices that return nothing. Software that probes
+ * the drawing area or the offset this way (GPU detection reads index 4, then
+ * 7: versions.md:70-79) got the wrong register. */
 static void gp1_get_gpu_info(Gpu* gpu, uint32_t value) {
-    uint32_t subfn = value & 0xF;
-    uint32_t result = 0;
-    switch (subfn) {
+    const uint32_t index = value & 0xF;
+    const uint32_t old   = gpu->gpu_info_latch;
+    uint32_t result;
+    switch (index) {
         case 0x02:
-            // Texture page info (same format as GP0(E1))
-            result  = (uint32_t)gpu->page_base_x;
-            result |= (uint32_t)gpu->page_base_y << 4;
-            result |= (uint32_t)gpu->semi_transparency << 5;
-            result |= (uint32_t)gpu->texture_depth << 7;
-            result |= (uint32_t)gpu->dithering << 9;
-            result |= (uint32_t)gpu->draw_to_display << 10;
-            result |= (uint32_t)gpu->texture_disable << 11;
-            result |= (uint32_t)gpu->rectangle_texture_x_flip << 12;
-            result |= (uint32_t)gpu->rectangle_texture_y_flip << 13;
-            break;
-        case 0x03:
-            // Texture window (same format as GP0(E2))
             result  = (uint32_t)gpu->texture_window_x_mask;
             result |= (uint32_t)gpu->texture_window_y_mask   << 5;
             result |= (uint32_t)gpu->texture_window_x_offset << 10;
             result |= (uint32_t)gpu->texture_window_y_offset << 15;
+            result  = (old & ~0xFFFFFu) | (result & 0xFFFFFu);
             break;
-        case 0x04:
-            // Drawing area top-left (same format as GP0(E3))
+        case 0x03:
             result  = (uint32_t)gpu->drawing_area_left;
             result |= (uint32_t)gpu->drawing_area_top << 10;
+            result  = (old & ~0xFFFFFu) | (result & 0xFFFFFu);
             break;
-        case 0x05:
-            // Drawing area bottom-right (same format as GP0(E4))
+        case 0x04:
             result  = (uint32_t)gpu->drawing_area_right;
             result |= (uint32_t)gpu->drawing_area_bottom << 10;
+            result  = (old & ~0xFFFFFu) | (result & 0xFFFFFu);
             break;
-        case 0x06:
-            // Drawing offset (same format as GP0(E5))
+        case 0x05:
             result  = (uint32_t)(gpu->drawing_x_offset & 0x7FF);
             result |= (uint32_t)((gpu->drawing_y_offset & 0x7FF) << 11);
             break;
         case 0x07:
-            result = 0x00000002; // GPU type: version 2
+            result = 0x00000002;   /* GPU type: version 2 */
             break;
-        default:
-            result = 0;
+        case 0x08:
+            result = 0x00000000;
+            break;
+        default:                   /* 00h, 01h, 06h, 09h-0Fh: nothing */
+            result = old;
             break;
     }
     gpu->gpu_info_latch = result;
-    LOG_GPU_DEBUG("[GPU] GP1(0x10): GetGPUInfo subfn=%u -> 0x%08x", subfn, result);
+    LOG_GPU_DEBUG("[GPU] GP1(0x10): GetGPUInfo index=%u -> 0x%08x", index, result);
 }
 
 // ---------------------------------------------------------------------------
 // Public GP1 entry point
 // ---------------------------------------------------------------------------
 void gpu_gp1(Gpu* gpu, uint32_t command) {
-    uint32_t opcode = (command >> 24) & 0xFF;
+    /* "GP1(40h..FFh) - N/A (Mirrors) Mirrors of GP1(00h..3Fh)" (psx-spx
+     * gpu/display-control-commands-gp1.md:243-244). */
+    uint32_t opcode = (command >> 24) & 0x3F;
     switch (opcode) {
         case 0x00: gp1_reset(gpu, command); break;
         case 0x01: gp1_reset_command_buffer(gpu, command); break;
@@ -563,6 +577,7 @@ uint32_t gpu_read_data(Gpu* gpu) {
         }
         uint32_t idx = gpu->vram_load_count;
         uint16_t pixel1 = 0, pixel2 = 0;
+        uint32_t word;
 
         uint16_t x1 = (gpu->vram_load_x + (uint16_t)(idx % gpu->vram_load_w)) & 0x3FF;
         uint16_t y1 = (gpu->vram_load_y + (uint16_t)(idx / gpu->vram_load_w)) & 0x1FF;
@@ -585,19 +600,16 @@ uint32_t gpu_read_data(Gpu* gpu) {
             gpu->gp0_mode = GP0_MODE_COMMAND;
             LOG_GPU_DEBUG("[GPU] GP0(0xC0): VRAM→CPU transfer COMPLETE");
         }
-        return (uint32_t)pixel1 | ((uint32_t)pixel2 << 16);
+        word = (uint32_t)pixel1 | ((uint32_t)pixel2 << 16);
+        gpu->gpu_info_latch = word;   /* GPUREAD is one register: it keeps the last word */
+        return word;
     }
 
-    // GP1(0x10) info latch
-    if (gpu->gpu_info_latch != 0) {
-        uint32_t v = gpu->gpu_info_latch;
-        gpu->gpu_info_latch = 0;
-        return v;
-    }
-
-    // Fallback
-    static uint32_t dummy = 0;
-    return dummy++;
+    /* "The selected data is latched in GP0, the same/latched value can be read
+     * multiple times" (psx-spx gpu/display-control-commands-gp1.md:204-205).
+     * It used to be cleared by the first read, and a read of an empty latch
+     * returned an incrementing counter. */
+    return gpu->gpu_info_latch;
 }
 
 // ---------------------------------------------------------------------------

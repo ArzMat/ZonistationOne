@@ -15,11 +15,17 @@
  * state machine around them are this project's own — the documented pseudocode
  * decodes from a flat source buffer, while this has to make progress a
  * halfword at a time as DMA delivers them.
+ *
+ * Line numbers in the comments below that say "psx-spx" refer to the current
+ * psx-spx layout, ps1/cpu/mdec/macroblockdecodermdec.md (abbreviated mdec.md):
+ * rl_decode_block is at :146-166, real_idct_core at :200-226, yuv_to_rgb at
+ * :228-244, y_to_mono at :246-255.
  */
 
 #include "mdec.h"
 #include "log.h"
 #include "lua_debug.h"
+#include <stdlib.h>
 #include <string.h>
 
 /* -------------------------------------------------------------------------
@@ -42,14 +48,17 @@ static void in_push(Mdec* m, uint16_t v) {
     m->in_count++;
 }
 static bool out_empty(const Mdec* m)   { return m->out_count == 0; }
+/* The output FIFO is 768 words, not a power of two, so the index wraps with a
+ * compare rather than a modulo: this runs once per output word, 128 or 192
+ * times per macroblock. */
 static void out_push(Mdec* m, uint32_t v) {
     m->out_buf[m->out_tail] = v;
-    m->out_tail = (m->out_tail + 1) % MDEC_OUT_FIFO_W;
+    if (++m->out_tail == MDEC_OUT_FIFO_W) m->out_tail = 0;
     m->out_count++;
 }
 static uint32_t out_pop(Mdec* m) {
     uint32_t v = m->out_buf[m->out_head];
-    m->out_head = (m->out_head + 1) % MDEC_OUT_FIFO_W;
+    if (++m->out_head == MDEC_OUT_FIFO_W) m->out_head = 0;
     m->out_count--;
     return v;
 }
@@ -57,10 +66,65 @@ static uint32_t out_pop(Mdec* m) {
 /* -------------------------------------------------------------------------
  * Status register
  * ---------------------------------------------------------------------- */
+
+/* Status bits 15-0 while no MDEC(1/2/3) is running.
+ *
+ * psx-spx mdec.md:43 defines them as "Number of Parameter Words remaining minus
+ * 1 (FFFFh=None)"; the reset value is 0000h (status=80040000h, :58); MDEC(0)
+ * and MDEC(4..7) copy their command bits 0-15 there "without the minus 1
+ * effect, and without actually expecting any parameters" (:120-126). While a
+ * command runs the value follows from remaining_halfwords; once it is idle the
+ * last of the three above has to be remembered somewhere.
+ *
+ * A file-static rather than a field in Mdec for the same reason as
+ * g_mdec_macroblocks_out below: Mdec is saved as one sized span, and a new
+ * field would make every existing state unloadable. mdec_state_restored()
+ * resets it after a load. */
+static uint16_t g_mdec_idle_low16 = 0;
+
+/* Bit 30 is "Data-In Fifo Full (0=No, 1=Full, or Last word received)"
+ * (psx-spx mdec.md:34). The last word of a command has been received once the
+ * input FIFO holds everything the running command still has to consume. */
+static bool mdec_last_word_received(const Mdec* m) {
+    if (m->decode_state == MDEC_ST_IDLE) return false;
+    return m->in_count >= m->remaining_halfwords;
+}
+
+/* Bits 18-16, "Current Block (0..3=Y1..Y4, 4=Cr, 5=Cb) (or for mono: always
+ * 4=Y)" (psx-spx mdec.md:42). "If there's data in the output fifo, then the
+ * Current Block bits are always set to the current output block number (ie.
+ * Y1..Y4; or Y for mono) ... If the output fifo is empty, then the bits
+ * indicate the currently processsed incoming block" (:45-50).
+ *
+ * The output FIFO here holds a whole macroblock already in the 16x16 order
+ * DMA1 would produce, so the output block is taken from how far the macroblock
+ * has been read: each quarter of it is one 8x8 block's worth of words. */
+static uint32_t mdec_status_block(const Mdec* m) {
+    if (!out_empty(m)) {
+        if (m->output_depth <= 1) return 4u;
+        uint32_t total  = (m->output_depth == 2) ? 192u : 128u;
+        uint32_t popped = (m->out_count < total) ? total - m->out_count : 0u;
+        return (popped * 4u) / total;
+    }
+    /* current_block: 0=Cr 1=Cb 2..5=Y1..Y4; mono decodes into block 0 -> 4=Y. */
+    return (m->current_block + 4u) % (uint32_t)MDEC_NUM_BLOCKS;
+}
+
+/* Bits 15-0: the parameter words a running MDEC(1/2/3) still expects, minus 1
+ * (psx-spx mdec.md:43). A word whose first halfword has been consumed and its
+ * second not yet still counts as remaining, and 0 remaining reads FFFFh: the
+ * command can be busy with no parameters left while its last macroblock waits
+ * for the output FIFO to drain. */
+static uint16_t mdec_status_low16(const Mdec* m) {
+    if (m->decode_state == MDEC_ST_IDLE) return g_mdec_idle_low16;
+    return (uint16_t)(((m->remaining_halfwords + 1u) >> 1) - 1u);
+}
+
 static uint32_t mdec_get_status(const Mdec* m) {
     uint32_t s = 0;
     if (out_empty(m))   s |= (1u << 31);  /* data_out_fifo_empty */
-    if (in_full(m))     s |= (1u << 30);  /* data_in_fifo_full */
+    if (in_full(m) || mdec_last_word_received(m))
+                        s |= (1u << 30);  /* data_in_fifo_full, or last word received */
     if (m->decode_state != MDEC_ST_IDLE)
                         s |= (1u << 29);  /* command_busy */
     bool in_req  = m->enable_dma_in  && (in_space(m) >= 64);
@@ -70,9 +134,8 @@ static uint32_t mdec_get_status(const Mdec* m) {
     s |= ((uint32_t)m->output_depth & 3u) << 25;
     if (m->output_signed)  s |= (1u << 24);
     s |= ((uint32_t)m->output_bit15 & 1u) << 23;
-    s |= ((m->current_block + 4u) % (uint32_t)MDEC_NUM_BLOCKS) << 16;
-    if (m->decode_state != MDEC_ST_IDLE && m->remaining_halfwords >= 2)
-        s |= (uint16_t)((m->remaining_halfwords / 2u) - 1u);
+    s |= mdec_status_block(m) << 16;
+    s |= mdec_status_low16(m);
     return s;
 }
 
@@ -165,7 +228,7 @@ static bool mdec_decode_rle(Mdec* m, int16_t* blk, const uint8_t* qt) {
 }
 
 /* -------------------------------------------------------------------------
- * IDCT — DOCS/macroblockdecodermdec.md:192-212 (real_idct_core).
+ * IDCT: real_idct_core, psx-spx mdec.md:200-226.
  *
  *   for pass = 0 to 1
  *     for x = 0 to 7, for y = 0 to 7
@@ -174,69 +237,170 @@ static bool mdec_decode_rle(Mdec* m, int16_t* blk, const uint8_t* qt) {
  *     swap(src, dst)
  *
  * The "+0FFFh then /2000h" strips the fractional bits and rounds up when the
- * fraction was above a half; the documentation notes (:213-218) that hardware
+ * fraction was above a half; the documentation notes (:220-226) that hardware
  * is only approximately this, so exactness beyond it is not claimed. The shift
  * is arithmetic rather than a C division so negative sums floor the way a
  * hardware shifter does instead of truncating toward zero.
+ *
+ * "scaletable/8": "the hardware does actually use only the upper 13bit of
+ * those 16bit values" (mdec.md:317-318). Keeping the upper 13 bits of a signed
+ * 16-bit value is a floor division by 8, which is what g_scale_k holds. The C
+ * "/ 8" used before truncated toward zero, so for 28 of the 64 standard
+ * entries (the negative ones whose low 3 bits are not zero) the result
+ * depended on the low 3 bits the hardware ignores, one step off.
+ *
+ * Range, and why int32 is exact. The RLE stage saturates every coefficient to
+ * -400h..3FFh (mdec_decode_rle, mdec.md:156), so |src| <= 1024 in pass 0, and
+ * |scale/8| <= 4096 for any 16-bit table. Pass 0: |sum| <= 8*1024*4096 = 2^25,
+ * so |dst| <= (2^25+0FFFh)>>13 = 4096. Pass 1: |sum| <= 8*4096*4096 = 2^27,
+ * so the output is within +-2^14 = 16384 and fits the int16_t block. Both sums
+ * plus 0FFFh stay far below 2^31, so 32-bit accumulators give exactly what the
+ * 64-bit ones did.
  * ---------------------------------------------------------------------- */
-static void mdec_idct(Mdec* m, int16_t* blk) {
-    int32_t src[64], dst[64];
-    for (int i = 0; i < 64; i++) src[i] = blk[i];
 
-    for (int pass = 0; pass < 2; pass++) {
-        for (int x = 0; x < 8; x++) {
-            for (int y = 0; y < 8; y++) {
-                int64_t sum = 0;
-                for (int z = 0; z < 8; z++)
-                    sum += (int64_t)src[y + z*8] * (int32_t)(m->scale_table[x + z*8] / 8);
-                dst[x + y*8] = (int32_t)((sum + 0xFFF) >> 13);
-            }
-        }
-        for (int i = 0; i < 64; i++) src[i] = dst[i];
+/* scale_table[i] >> 3 (the upper 13 bits), rebuilt whenever the table it was
+ * taken from differs from the live one. Kept out of Mdec so the saved span
+ * does not change; the memcmp makes it follow a savestate load, a reset or an
+ * MDEC(3) without anyone having to remember to refresh it. */
+static int16_t g_scale_src[64];
+static int32_t g_scale_k[64];
+static bool    g_scale_k_valid = false;
+
+static void mdec_refresh_scale_k(const Mdec* m) {
+    if (g_scale_k_valid && memcmp(g_scale_src, m->scale_table, sizeof g_scale_src) == 0)
+        return;
+    for (int i = 0; i < 64; i++) {
+        int32_t s = m->scale_table[i];
+        int32_t q = s / 8;
+        if (s < 0 && (s % 8) != 0) q -= 1;   /* floor, i.e. drop the low 3 bits */
+        g_scale_k[i] = q;
     }
+    memcpy(g_scale_src, m->scale_table, sizeof g_scale_src);
+    g_scale_k_valid = true;
+}
 
-    /* y_to_mono's 9-bit clip applies to whatever leaves the IDCT. */
-    for (int i = 0; i < 64; i++)
-        blk[i] = (int16_t)clamp_s32(sign_extend9(src[i] & 0x1FF), -128, 127);
+/* One pass: dst[x+y*8] = (SUM_z src[y+z*8] * k[x+z*8] + 0FFFh) >> 13.
+ *
+ * The sum is built row of src by row of src (z outermost), as an outer product
+ * of src's row z (over y) with k's row z (over x). Integer addition does not
+ * care about the order, so this is the same sum as the documented loop; it lets
+ * the inner loop run over 8 contiguous int32 lanes, and a row of zero
+ * coefficients, the usual case after RLE, is skipped outright. */
+static void mdec_idct_pass(const int32_t* restrict src, int32_t* restrict dst,
+                           const int32_t* restrict k) {
+    int32_t acc[64];   /* acc[x*8 + y] */
+    memset(acc, 0, sizeof acc);
+    for (int z = 0; z < 8; z++) {
+        const int32_t* s  = src + z * 8;
+        const int32_t* kz = k + z * 8;
+        if ((s[0] | s[1] | s[2] | s[3] | s[4] | s[5] | s[6] | s[7]) == 0) continue;
+        for (int x = 0; x < 8; x++) {
+            const int32_t kx = kz[x];
+            int32_t* a = acc + x * 8;
+            for (int y = 0; y < 8; y++) a[y] += s[y] * kx;
+        }
+    }
+    for (int x = 0; x < 8; x++)
+        for (int y = 0; y < 8; y++)
+            dst[x + y * 8] = (acc[x * 8 + y] + 0xFFF) >> 13;
+}
+
+/* The block leaves the IDCT unclipped. Both consumers clip it themselves, each
+ * as the documentation says: y_to_mono wraps Y to 9 bits (mdec.md:250), and
+ * yuv_to_rgb clips Y+R, Y+G, Y+B, not Y, Cr or Cb on their own (:235). This used
+ * to clip every block here, chroma included, which dimmed saturated colours at
+ * the edges of bright areas. */
+static void mdec_idct(const Mdec* m, int16_t* blk) {
+    int32_t a[64], b[64];
+    mdec_refresh_scale_k(m);
+    for (int i = 0; i < 64; i++) a[i] = blk[i];
+    mdec_idct_pass(a, b, g_scale_k);
+    mdec_idct_pass(b, a, g_scale_k);
+    for (int i = 0; i < 64; i++) blk[i] = (int16_t)a[i];   /* |a[i]| <= 16384, see above */
 }
 
 /* -------------------------------------------------------------------------
- * YUV -> RGB — DOCS/macroblockdecodermdec.md:220-234 (yuv_to_rgb).
+ * YUV -> RGB: yuv_to_rgb, psx-spx mdec.md:228-244.
+ *
+ *   R=(Y+R) AND 1FFh, G=(Y+G) AND 1FFh, B=(Y+B) AND 1FFh ;clip to signed 9bit
+ *   R=MinMax(-128,127,R) ...                               ;saturate to 8 bit
+ *
+ * Only the saturation is applied by default. Taken literally, the 9-bit wrap
+ * turns any Y+R above 255 into a small or negative number: Y=120 with Cr=100
+ * gives R=0 instead of 255, a bright red pixel that comes out black. No hardware
+ * capture available to this project shows that happening, and the same text
+ * calls its own arithmetic approximate (:244), so the safe reading is the one
+ * that cannot invert a highlight. ZS1_MDEC_WRAP9=1 applies the documented wrap
+ * as written, for the A/B against a capture that would settle it.
+ *
  * The documentation notes the exact fixed-point resolution is unknown, so the
  * published float coefficients are used as written.
- * Writes one 8×8 quadrant into block_rgb[0..255] (16×16 layout).
  * ---------------------------------------------------------------------- */
+static int g_mdec_wrap9 = -1;
+
+static bool mdec_wrap9(void) {
+    if (g_mdec_wrap9 < 0) {
+        const char* v = getenv("ZS1_MDEC_WRAP9");
+        g_mdec_wrap9 = (v && v[0] == '1') ? 1 : 0;
+        if (g_mdec_wrap9)
+            LOG_MDEC_INFO("[MDEC] ZS1_MDEC_WRAP9=1: yuv_to_rgb wraps Y+C to signed 9 bits "
+                          "before saturating (mdec.md:235)");
+    }
+    return g_mdec_wrap9 != 0;
+}
+
+/* The chroma terms depend only on the Cr/Cb sample, and each sample covers a
+ * 2x2 group of pixels (mdec.md:232), so they are computed once per sample with
+ * the same float expressions instead of once per pixel. */
+static void mdec_chroma_terms(const int16_t* Crblk, const int16_t* Cbblk,
+                              int16_t* Rc, int16_t* Gc, int16_t* Bc) {
+    for (int i = 0; i < 64; i++) {
+        int16_t R = Crblk[i];
+        int16_t B = Cbblk[i];
+        Gc[i] = (int16_t)(-0.3437f*(float)B + -0.7143f*(float)R);
+        Rc[i] = (int16_t)(1.402f*(float)R);
+        Bc[i] = (int16_t)(1.772f*(float)B);
+    }
+}
+
+static inline int32_t mdec_rgb_channel(int32_t sum, bool wrap9) {
+    if (wrap9) sum = sign_extend9(sum & 0x1FF);
+    return clamp_s32(sum, -128, 127);
+}
+
+/* Writes one 8x8 quadrant into block_rgb[0..255] (16x16 layout).
+ *
+ * Each channel is masked to its 8 bits before packing. With signed output
+ * (mdec.md:39, :239: the xor 808080h is skipped) a negative channel is a
+ * negative int, and packing it unmasked spread its sign bits over the channels
+ * above it: a grey of Y=-60 came out with G and B both at 31 in 15bpp. */
 static void mdec_yuv_to_rgb(Mdec* m, uint32_t xx, uint32_t yy,
-                             const int16_t* Crblk,
-                             const int16_t* Cbblk,
-                             const int16_t* Yblk) {
-    int16_t addval = m->output_signed ? 0 : 0x80;
+                            const int16_t* Rc, const int16_t* Gc, const int16_t* Bc,
+                            const int16_t* Yblk, bool wrap9) {
+    const int32_t addval = m->output_signed ? 0 : 0x80;
     for (uint32_t y = 0; y < 8; y++) {
         for (uint32_t x = 0; x < 8; x++) {
-            int16_t R  = Crblk[((x+xx)/2) + ((y+yy)/2)*8];
-            int16_t B  = Cbblk[((x+xx)/2) + ((y+yy)/2)*8];
-            int16_t G  = (int16_t)(-0.3437f*(float)B + -0.7143f*(float)R);
-            R = (int16_t)(1.402f*(float)R);
-            B = (int16_t)(1.772f*(float)B);
-            int16_t Y  = Yblk[x + y*8];
-            R = (int16_t)clamp_s32((int32_t)Y + R, -128, 127) + addval;
-            G = (int16_t)clamp_s32((int32_t)Y + G, -128, 127) + addval;
-            B = (int16_t)clamp_s32((int32_t)Y + B, -128, 127) + addval;
-            m->block_rgb[(x+xx) + (y+yy)*16] =
-                (uint32_t)(uint16_t)R |
-                ((uint32_t)(uint16_t)G << 8) |
-                ((uint32_t)(uint16_t)B << 16);
+            const uint32_t c = ((x + xx) >> 1) + ((y + yy) >> 1) * 8u;
+            const int32_t  Y = Yblk[x + y * 8];
+            const int32_t  R = mdec_rgb_channel(Y + Rc[c], wrap9) + addval;
+            const int32_t  G = mdec_rgb_channel(Y + Gc[c], wrap9) + addval;
+            const int32_t  B = mdec_rgb_channel(Y + Bc[c], wrap9) + addval;
+            m->block_rgb[(x + xx) + (y + yy) * 16] =
+                ((uint32_t)R & 0xFFu) |
+                (((uint32_t)G & 0xFFu) << 8) |
+                (((uint32_t)B & 0xFFu) << 16);
         }
     }
 }
 
-/* Mono — DOCS/macroblockdecodermdec.md:236-245 (y_to_mono): clip to signed
- * 9 bits, saturate to signed 8, then bias by 128 unless output is signed. */
+/* Mono: y_to_mono, psx-spx mdec.md:246-254: clip to signed 9 bits ("Y AND
+ * 1FFh"), saturate to signed 8, then bias by 128 unless output is signed. The
+ * result is masked to 8 bits for the same reason as the colour path. */
 static void mdec_yuv_to_mono(Mdec* m) {
-    int32_t addval = m->output_signed ? 0 : 0x80;
+    const int32_t addval = m->output_signed ? 0 : 0x80;
     for (int i = 0; i < 64; i++) {
-        int32_t v = clamp_s32(sign_extend9((int32_t)m->blocks[0][i]), -128, 127);
-        m->block_rgb[i] = (uint32_t)(v + addval);
+        int32_t v = clamp_s32(sign_extend9((int32_t)m->blocks[0][i] & 0x1FF), -128, 127);
+        m->block_rgb[i] = (uint32_t)(v + addval) & 0xFFu;
     }
 }
 
@@ -345,10 +509,13 @@ static bool mdec_decode_macroblock(Mdec* m) {
         m->current_coefficient = 64;
         m->current_q_scale = 0;
         LOG_MDEC_DEBUG("[MDEC] Decoded color macroblock, %u hw remain", m->remaining_halfwords);
-        mdec_yuv_to_rgb(m, 0, 0, m->blocks[0], m->blocks[1], m->blocks[2]);
-        mdec_yuv_to_rgb(m, 8, 0, m->blocks[0], m->blocks[1], m->blocks[3]);
-        mdec_yuv_to_rgb(m, 0, 8, m->blocks[0], m->blocks[1], m->blocks[4]);
-        mdec_yuv_to_rgb(m, 8, 8, m->blocks[0], m->blocks[1], m->blocks[5]);
+        int16_t Rc[64], Gc[64], Bc[64];
+        mdec_chroma_terms(m->blocks[0], m->blocks[1], Rc, Gc, Bc);
+        const bool wrap9 = mdec_wrap9();
+        mdec_yuv_to_rgb(m, 0, 0, Rc, Gc, Bc, m->blocks[2], wrap9);
+        mdec_yuv_to_rgb(m, 8, 0, Rc, Gc, Bc, m->blocks[3], wrap9);
+        mdec_yuv_to_rgb(m, 0, 8, Rc, Gc, Bc, m->blocks[4], wrap9);
+        mdec_yuv_to_rgb(m, 8, 8, Rc, Gc, Bc, m->blocks[5], wrap9);
         lua_debug_notify("mdec_macroblock");
         mdec_copy_out_block(m);
         return true;
@@ -440,11 +607,24 @@ void mdec_execute(Mdec* m) {
                         new_state = MDEC_ST_SET_SCALE;
                         break;
                     default:
-                        LOG_MDEC_WARN("[MDEC] Invalid command 0x%08x (cmd=%u)", cw, cmd);
-                        num_words = cw & 0xFFFFu;
-                        new_state = MDEC_ST_NOCOMMAND;
-                        break;
+                        /* MDEC(0) "has no function": bits 25-28 go to the status
+                         * as usual (done above) and bits 0-15 are reflected to
+                         * status bits 0-15 "without the minus 1 effect, and
+                         * without actually expecting any parameters"; MDEC(4..7)
+                         * "act identical as MDEC(0)" (psx-spx mdec.md:119-126).
+                         *
+                         * This used to wait for cw&FFFFh parameter words and
+                         * swallow them. FE00h padding (mdec.md:77-79) arriving
+                         * as a command word reads as FE00FE00h, an MDEC(7) for
+                         * 65024 words, and it ate the next frame whole. */
+                        g_mdec_idle_low16 = (uint16_t)(cw & 0xFFFFu);
+                        LOG_MDEC_DEBUG("[MDEC] Command %u (0x%08x): no function, no parameters",
+                                       cmd, cw);
+                        continue;
                 }
+                /* What bits 15-0 read once this command has finished: "minus 1
+                 * (FFFFh=None)" (psx-spx mdec.md:43). */
+                g_mdec_idle_low16 = 0xFFFFu;
                 m->remaining_halfwords = num_words * 2u;
                 m->decode_state = new_state;
                 LOG_MDEC_DEBUG("[MDEC] Command: cmd=%u depth=%u signed=%d nwords=%u",
@@ -488,11 +668,11 @@ void mdec_execute(Mdec* m) {
             }
 
             case MDEC_ST_NOCOMMAND: {
-                uint32_t consume = m->remaining_halfwords < m->in_count
-                                   ? m->remaining_halfwords : m->in_count;
-                for (uint32_t i = 0; i < consume; i++) in_pop(m);
-                m->remaining_halfwords -= consume;
-                if (m->remaining_halfwords > 0) goto finished;
+                /* Nothing enters this state any more (MDEC(0)/(4..7) take no
+                 * parameters, see above). A state saved by an older build can
+                 * still be in it: drop the count it was waiting for, so the next
+                 * word is taken as the command it is. */
+                m->remaining_halfwords = 0;
                 m->decode_state = MDEC_ST_IDLE;
                 continue;
             }
@@ -505,10 +685,45 @@ finished:;
  * Public API
  * ====================================================================== */
 
+/* Power-on state: everything zero, tables included. "There is no usable scale
+ * matrix until MDEC(3) has been issued: software that never sends one decodes
+ * to flat mid-grey" (psx-spx mdec.md:114-116). */
 void mdec_init(Mdec* m) {
     memset(m, 0, sizeof(Mdec));
     m->current_coefficient = 64;  /* 64 = start-of-block sentinel */
+    g_mdec_idle_low16 = 0;
     LOG_MDEC_INFO("[MDEC] Initialized");
+}
+
+/* 1F801824h bit 31: "Abort any command, and set status=80040000h" (psx-spx
+ * mdec.md:58), but "the Reset bit does NOT clear the scale matrix nor the quant
+ * tables, so they only need uploading once, not after every reset" (:116-117).
+ *
+ * This used to be mdec_init(), which zeroed the tables too: a game that resets
+ * the MDEC between two movies without re-sending them decoded the second one as
+ * flat grey. */
+static void mdec_soft_reset(Mdec* m) {
+    uint8_t iq_y[64], iq_uv[64];
+    int16_t scale[64];
+    memcpy(iq_y,  m->iq_y,        sizeof iq_y);
+    memcpy(iq_uv, m->iq_uv,       sizeof iq_uv);
+    memcpy(scale, m->scale_table, sizeof scale);
+    memset(m, 0, sizeof(Mdec));
+    m->current_coefficient = 64;
+    memcpy(m->iq_y,        iq_y,  sizeof iq_y);
+    memcpy(m->iq_uv,       iq_uv, sizeof iq_uv);
+    memcpy(m->scale_table, scale, sizeof scale);
+    g_mdec_idle_low16 = 0;        /* status 80040000h: bits 15-0 read 0000h */
+}
+
+void mdec_state_restored(Mdec* m) {
+    (void)m;
+    /* The idle value of status bits 15-0 is not in the saved span (see
+     * g_mdec_idle_low16). FFFFh is what it reads after any completed
+     * MDEC(1/2/3), which is where a running game almost always is; a state
+     * taken right after a reset or an MDEC(0) reads FFFFh here instead of 0000h
+     * or the MDEC(0) count until the next command. */
+    g_mdec_idle_low16 = 0xFFFFu;
 }
 
 uint32_t mdec_read(Mdec* m, uint32_t addr) {
@@ -527,7 +742,7 @@ void mdec_write(Mdec* m, uint32_t addr, uint32_t value) {
     if (addr == 0x1F801824) {
         LOG_MDEC_DEBUG("[MDEC] Control <- 0x%08x", value);
         if (value & (1u << 31)) {
-            mdec_init(m);
+            mdec_soft_reset(m);
             LOG_MDEC_INFO("[MDEC] Software reset");
             return;
         }

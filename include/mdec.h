@@ -28,7 +28,8 @@
  *   24: output signed
  *   23: output bit15
  *   18-16: current block index
- *   15-0: parameter words remaining
+ *   15-0: parameter words remaining minus 1 (FFFFh = none; the MDEC(0)
+ *         count, or 0000h after reset, while idle)
  */
 
 #include <stdint.h>
@@ -44,7 +45,8 @@ typedef enum {
     MDEC_ST_WRITING,
     MDEC_ST_SET_QTABLE,
     MDEC_ST_SET_SCALE,
-    MDEC_ST_NOCOMMAND
+    MDEC_ST_NOCOMMAND    /* no longer entered: MDEC(0)/(4..7) take no parameters.
+                          * Kept so a state saved by an older build still loads. */
 } MdecDecodeState;
 
 typedef struct Mdec {
@@ -94,6 +96,10 @@ uint32_t mdec_dma_out(Mdec* m);                  /* DMA1: pull one 32-bit word *
 bool     mdec_input_has_space(const Mdec* m);    /* true: room for >=1 more word (2 halfwords) */
 bool     mdec_output_has_data(const Mdec* m);    /* true: at least 1 word ready to pop */
 void     mdec_execute(Mdec* m);                  /* try to advance the decode state machine */
+
+/* Re-derive the state that lives outside the saved Mdec span (the idle value
+ * of status bits 15-0). Call after a savestate has been read into *m. */
+void     mdec_state_restored(Mdec* m);
 
 /* Macroblocks pushed out since boot — a UI counter, deliberately not part of
  * the savestated struct. */

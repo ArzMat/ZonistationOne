@@ -155,6 +155,21 @@ bool savestate_save(const char* path, struct Cpu* cpu, struct Interconnect* inte
         return false;
     }
 
+    /* VRAM lives in the renderer. gpu.vram.data holds what the CPU, DMA and
+     * MDEC wrote, never a pixel the rasteriser drew, so saving it as it is lost
+     * everything drawn that the game does not draw again after a load: a
+     * screen drawn once and left, a texture built by drawing. Pull the whole of
+     * it back first. The wait lets the field already submitted finish on the
+     * GPU thread; the readback itself is synchronous through it. With no live
+     * renderer there is nothing to pull and the CPU copy is saved as before. */
+    renderer_wait_frame_done(&inter->gpu.renderer);
+    if (renderer_read_vram_rect(&inter->gpu.renderer, (uint16_t*)(void*)inter->gpu.vram.data,
+                                0, 0, VRAM_WIDTH, VRAM_HEIGHT))
+        vram_raster_clear(0, 0, VRAM_WIDTH, VRAM_HEIGHT);   /* the CPU copy is now the whole truth */
+    else
+        LOG_SYSTEM_WARN("[STATE] VRAM readback refused: saving the CPU copy only, "
+                        "without the pixels the renderer drew");
+
     uint32_t magic = ZS1_STATE_MAGIC, version = ZS1_STATE_VERSION;
     bool ok = fwrite(&magic, 4, 1, f) == 1 && fwrite(&version, 4, 1, f) == 1;
 
@@ -379,6 +394,10 @@ bool savestate_load(const char* path, struct Cpu* cpu, struct Interconnect* inte
     memcpy(inter->memctrl_regs, ib.memctrl_regs, sizeof(ib.memctrl_regs));
     inter->bios_access_cycles = ib.bios_access_cycles;
 
+    /* State the MDEC keeps outside its saved span (the idle value of status
+     * bits 15-0) is re-derived rather than left at whatever this session had. */
+    mdec_state_restored(&inter->mdec);
+
     /* VBlank must always be in the queue. It is the frame boundary, the source
      * of IRQ0 and the only event that re-arms itself, so a state that lost it —
      * anything written from inside the dispatch, before the handler rescheduled
@@ -414,7 +433,11 @@ bool savestate_load(const char* path, struct Cpu* cpu, struct Interconnect* inte
      * the previous state left on screen. */
     renderer_upload_vram_rect(&inter->gpu.renderer,
                               (const uint16_t*)inter->gpu.vram.data, 0, 0, 1024, 512);
-    inter->gpu.vram_dirty = false;
+    /* The map of where the renderer may be ahead of the CPU copy is not in the
+     * file. The upload above makes the two agree, but if it was refused they do
+     * not, so every tile is taken as possibly ahead: the first GP0(80h)/(C0h)
+     * on each area reads back once, and is right either way. */
+    vram_raster_mark_all();
 
     LOG_SYSTEM_INFO("[STATE] Loaded %s (PC=0x%08x, cycle=%u)",
                     path, cpu->pc, inter->cpu_cycle_counter);

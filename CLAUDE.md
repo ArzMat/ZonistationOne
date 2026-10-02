@@ -482,6 +482,8 @@ The project is **GPL-3.0-or-later**; every source file carries an SPDX header an
 `docs/TESTING_PLAN_2026-08-20.md` is authoritative for **testing**: what exists (nothing automated),
 the four layers proposed, and the order. Read it before adding a test, and before claiming a
 subsystem is verified.
+The checks the 2026-10-02 work still owes a BIOS and a disc are written as step-by-step cards, in
+Italian, in `docs/PROVE_MANUALI_2026-10-02.md`: a session that has the discs starts there.
 
 See `docs/GAP_ANALYSIS_REFACTOR_2026-07-13.md` (per-subsystem state + work queue) and
 `docs/GPU_GAP_ANALYSIS_2026-07-15.md` (renderer deep dive) — both rewritten 2026-07-28 and authoritative

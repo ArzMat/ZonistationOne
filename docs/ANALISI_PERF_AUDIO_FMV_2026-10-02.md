@@ -1300,6 +1300,9 @@ main loop, thread, gating dei log, instradamento dei settori CD, writeback DMA, 
 
 ### Da verificare con BIOS e disco
 
+La procedura passo per passo, con comandi, righe di log e criteri di esito, è in
+`docs/PROVE_MANUALI_2026-10-02.md`.
+
 1. **Volume CD a 0 = silenzio.** È quello che dice la doc, ma se un gioco si affidava al vecchio
    "0 = volume pieno", ora il suo XA o CD-DA tace; una riga INFO nel log lo segnala. Da provare: il
    lettore CD del BIOS, gli FMV di Ace Combat 2, Dino Crisis.

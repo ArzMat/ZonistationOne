@@ -971,12 +971,16 @@ void lua_debug_init(struct Interconnect* inter, struct Cpu* cpu) {
     /* Individually require the libs we want instead of luaL_openlibs(), since
      * loadlib.c (package/require/dlopen) is deliberately excluded from the
      * build — a debug script has no legitimate use for dynamic native-lib
-     * loading, and skipping it drops the -ldl link requirement too. */
+     * loading, and skipping it drops the -ldl link requirement too.
+     * io is in: scripts/audio_raw_analyse.lua reads a ZS1_AUDIO_DUMP capture
+     * with it and could never run without it, and leaving it out protected
+     * nothing, since os (os.execute, os.remove) is already open. */
     static const luaL_Reg libs[] = {
         {"_G",     luaopen_base},
         {"table",  luaopen_table},
         {"string", luaopen_string},
         {"math",   luaopen_math},
+        {"io",     luaopen_io},
         {"os",     luaopen_os},
         {NULL, NULL}
     };

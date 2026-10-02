@@ -166,8 +166,19 @@ all pass after them. The list of what still needs a real run is at the end of th
   `emu.spu_irq()`, `emu.cd_state()`**, **`scripts/cutscene_audio_classify.lua`**, and
   **`ZS1_SPU_RING_TARGET=<frames>`**. `audio_timeline.lua` and `spu_pop_capture.lua` read
   `emu.cd_audio()` in its real order.
+- **Lua scripts get the `io` library.** `scripts/audio_raw_analyse.lua` reads a `ZS1_AUDIO_DUMP`
+  capture with it and stopped at its first line (`attempt to index a nil value (global 'io')`):
+  the library list in `lua_debug.c` predates the script and never had `io`. Leaving it out protected
+  nothing, since `os` (`os.execute`) was already open. Checked on a synthetic capture: the script
+  finds the 45 ms dropout and the single-sample step that were put in it.
+- **`docs/PROVE_MANUALI_2026-10-02.md`** (Italian): the checks below as step-by-step cards for a
+  Claude session on the machine with the BIOS images, the discs and both GPUs, with the commands,
+  the log lines to look for, the pass criteria, the A/B switch where one exists, and the part that
+  needs a person.
 
 #### Needs a run with a BIOS and a disc
+The procedure for each, and for the FMV, savestate, renderer-switch and cluster checks, is in
+`docs/PROVE_MANUALI_2026-10-02.md`.
 - **A CD volume of 0 now means silence.** If a title relied on the old "0 = full", its XA or CD-DA
   is now silent; the one-time INFO line in the log says so. Check the BIOS CD player, Ace Combat 2's
   FMV and Dino Crisis.

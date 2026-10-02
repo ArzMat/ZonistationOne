@@ -93,21 +93,40 @@ void eventq_dispatch_due(struct Interconnect* sys) {
     while (1) {
         uint32_t pending = sys->evq_pending;
         int any_fired = 0;
+        /* The next target, gathered on the way. It is only used from a pass in
+         * which nothing fired, and such a pass sees exactly what
+         * eventq_recompute_next() would see afterwards: no handler ran, so
+         * evq_pending, every target and cpu_cycle_counter are unchanged, and
+         * every pending event is one that did not fire. Same condition, same
+         * order, same result; one scan of the twelve slots fewer per
+         * dispatch. */
+        uint32_t soonest    = UINT32_MAX;
+        int32_t  best_delta = INT32_MAX;
         
         for (EventQueueType event = 0; event < EVQ_EVENT_COUNT; ++event) {
-            if ((pending & (1u << event)) && (int32_t)(now - sys->evq_target_cycle[event]) >= 0) {
+            if (!(pending & (1u << event))) continue;
+            const uint32_t target = sys->evq_target_cycle[event];
+            if ((int32_t)(now - target) >= 0) {
                 sys->evq_pending &= ~(1u << event);
                 if (evq_handlers[event]) {
                     evq_handlers[event](sys);
                 }
                 any_fired = 1;
+            } else {
+                const int32_t delta = (int32_t)(target - now);
+                if (delta > 0 && delta < best_delta) {
+                    best_delta = delta;
+                    soonest = target;
+                }
             }
         }
-        if (!any_fired) break;
+        if (!any_fired) {
+            sys->evq_next_cycle = soonest;   /* == eventq_recompute_next(sys) */
+            return;
+        }
         // After firing, update now in case event handler advanced cycles
         now = sys->cpu_cycle_counter;
     }
-    eventq_recompute_next(sys);
 }
 
 /* Derive the next-event anchor from the pending set rather than carrying it.

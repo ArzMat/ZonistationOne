@@ -38,8 +38,13 @@
  *    field after the GPRs moved by 128 bytes.
  * 10: MemoryCard gained backed_up, which sits inside the raw T_SIO struct — and
  *    loading a state no longer restores the memory cards at all (see the note
- *    at the T_SIO read below). */
-#define ZS1_STATE_VERSION 11u
+ *    at the T_SIO read below).
+ * 12: Cpu's exec trace ring went from 8192 to 1024 entries, so the raw T_CPU
+ *    section shrank by 56 KB, and Spu gained the 32-halfword manual-write FIFO
+ *    at its end (T_SPU grew). Both refuse a v11 state anyway on size; the
+ *    bump makes the refusal say why. Saves now also read the renderer's VRAM
+ *    back before writing it, so rasterised pixels survive a load. */
+#define ZS1_STATE_VERSION 12u
 
 #define TAG(a,b,c,d) ((uint32_t)(a) | ((uint32_t)(b) << 8) | ((uint32_t)(c) << 16) | ((uint32_t)(d) << 24))
 

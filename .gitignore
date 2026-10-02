@@ -112,3 +112,6 @@ cluster-data/
 tests/bin/
 pgo/
 tests/hw/build/
+
+# Python bytecode (deploy/session/webrtc_server.py, tests/hw/elf2exe.py)
+__pycache__/

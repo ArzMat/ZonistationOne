@@ -1235,10 +1235,13 @@ stessa run.
 Le correzioni sono sul branch `claude/wizardly-planck-fb7ppi`; il dettaglio è nel blocco del
 2026-10-02 in `CHANGELOG.md`. Nessuna è stata provata con un BIOS o un disco. Le verifiche fatte qui:
 
-- `make test`: otto programmi di test unitari (CPU, log, MDEC, VRAM, DMA, SPU, CD-ROM), tutti verdi;
-- `make hwtest`: quindici controlli in programmi PS-X EXE scritti apposta (`tests/hw/`), eseguiti
+- `make test`: nove programmi di test unitari (CPU, log, MDEC, VRAM, DMA, SPU, CD-ROM, isolamento
+  delle primitive nei renderer), tutti verdi;
+- `make hwtest`: sedici controlli in programmi PS-X EXE scritti apposta (`tests/hw/`), eseguiti
   dentro l'emulatore su un BIOS di zeri, sia su OpenGL sia su Vulkan (llvmpipe e lavapipe sotto
-  Xvfb). Sul codice di partenza fallivano 12 controlli su 15, almeno su un backend (gli altri 3 sono controlli di contorno); ora passano tutti
+  Xvfb). Sul codice di partenza fallivano 12 controlli su 16, almeno su un backend (gli altri 4 sono tre
+  controlli di contorno e quello della maschera, che sui rasterizzatori software passa anche senza
+  la correzione); ora passano tutti
   su entrambi;
 - un salvataggio e un caricamento sopra il test GPU: ciclo e PC tornano identici, e un pixel scritto
   solo dal rasterizzatore sopravvive al caricamento;

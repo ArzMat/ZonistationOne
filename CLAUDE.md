@@ -721,7 +721,7 @@ has to be there. Re-run before a release rather than trusting this line.
   like it had no effect, which invalidated most of a session — including three "measurements" taken
   against a day-old binary. `.DEFAULT_GOAL := all` fixes it. If a change ever seems to do nothing,
   check the binary's mtime before checking the change.
-- ~~`make test` is broken~~ Fixed 2026-10-02: `make test` runs eight unit tests (tests/*_test.c)
+- ~~`make test` is broken~~ Fixed 2026-10-02: `make test` runs nine unit tests (tests/*_test.c)
   and `make hwtest` runs bare-metal PS-X EXEs inside the emulator on both renderers (tests/hw/),
   layers 1 and 2 of the testing plan. Before that **there was no automated test of any kind in this
   repository**, and there is still none at the level of a game (layer 3): every accuracy claim about

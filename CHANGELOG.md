@@ -11,9 +11,9 @@ Format follows [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 
 Every item below rests on a psx-spx line (clone at commit `00d5dcb`, cited as `<path>:<line>`) or on
 a measurement in this environment. Nothing here was run against a BIOS or a disc: the checks are
-the unit tests (`make test`, 8 programs) and the new bare-metal hardware tests (`make hwtest`, 15
-checks on the OpenGL and the Vulkan renderer), which fail on the code before these changes and
-pass after them. The list of what still needs a real run is at the end of this block.
+the unit tests (`make test`, 9 programs) and the new bare-metal hardware tests (`make hwtest`, 16
+checks on the OpenGL and the Vulkan renderer). 12 of the 16 fail on the code before these changes;
+all pass after them. The list of what still needs a real run is at the end of this block.
 
 #### Fixed: audio in in-engine cutscenes
 - **XA sectors the filter rejects are discarded, not handed to the CPU.** With the XA filter on, an
@@ -152,8 +152,9 @@ pass after them. The list of what still needs a real run is at the end of this b
   3.4.0 measurement is written in the Dockerfile.
 
 #### Added
-- **`make test`** builds and runs eight self-contained unit tests (CPU decode, RAM fast path and
-  SWL/SWR, log gating, MDEC, VRAM rectangle split and tile map, DMA writeback, SPU, CDROM); the old
+- **`make test`** builds and runs nine self-contained unit tests (CPU decode, RAM fast path and
+  SWL/SWR, log gating, MDEC, VRAM rectangle split and tile map, DMA writeback, SPU, CDROM, which
+  primitives the renderers draw alone); the old
   target pointed at a file that did not exist.
 - **`make hwtest`** runs bare-metal PS-X EXEs inside the emulator on a zero BIOS, on both renderers
   (`tests/hw/`, needs `gcc-mipsel-linux-gnu` and `xvfb-run`).

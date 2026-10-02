@@ -6,6 +6,7 @@
  * components of this project that have other authors.
  */
 #include "cpu.h"
+#include "cpu_mem.h"
 #include "log.h"
 #include "interconnect.h"
 #include "gte.h"
@@ -35,7 +36,7 @@ void op_sw(Cpu* cpu, uint32_t instruction) {
     uint32_t value = cpu_reg(cpu, rt);
     if ((cpu->sr & 0x10000) != 0) {
         // Cache isolation: write invalidates I-cache line at this address
-        uint32_t paddr = mask_region(address);
+        uint32_t paddr = bus_mask_region(address);
         ICacheLine* line = &cpu->icache[(paddr >> 4) & (ICACHE_NUM_LINES - 1)];
         line->valid[0] = line->valid[1] = line->valid[2] = line->valid[3] = false;
         return;
@@ -195,8 +196,9 @@ void op_lw(Cpu* cpu, uint32_t instruction) {
         return;
     }
 
-    // Perform load and schedule it for the delay slot
-    uint32_t value_loaded = interconnect_load32(cpu->inter, address);
+    // Perform load and schedule it for the delay slot. cpu_load32 is the RAM
+    // fast path (cpu_mem.h): same value, same stall as interconnect_load32.
+    uint32_t value_loaded = cpu_load32(cpu->inter, address);
     cpu->load_reg_idx = rt;
     cpu->load_value = value_loaded;
 }
@@ -221,7 +223,7 @@ void op_sh(Cpu* cpu, uint32_t instruction) {
     uint32_t rs = instr_s(instruction);
     uint32_t address = cpu_reg(cpu, rs) + offset;
     if ((cpu->sr & 0x10000) != 0) {
-        uint32_t paddr = mask_region(address);
+        uint32_t paddr = bus_mask_region(address);
         ICacheLine* line = &cpu->icache[(paddr >> 4) & (ICACHE_NUM_LINES - 1)];
         line->valid[0] = line->valid[1] = line->valid[2] = line->valid[3] = false;
         return;
@@ -256,7 +258,7 @@ void op_sb(Cpu* cpu, uint32_t instruction) {
     uint32_t rs = instr_s(instruction);
     uint32_t address = cpu_reg(cpu, rs) + offset;
     if ((cpu->sr & 0x10000) != 0) {
-        uint32_t paddr = mask_region(address);
+        uint32_t paddr = bus_mask_region(address);
         ICacheLine* line = &cpu->icache[(paddr >> 4) & (ICACHE_NUM_LINES - 1)];
         line->valid[0] = line->valid[1] = line->valid[2] = line->valid[3] = false;
         return;
@@ -290,7 +292,7 @@ void op_lb(Cpu* cpu, uint32_t instruction) {
     uint32_t rt = instr_t(instruction);
     uint32_t rs = instr_s(instruction);
     uint32_t address = cpu_reg(cpu, rs) + offset;
-    uint8_t value_loaded = interconnect_load8(cpu->inter, address);
+    uint8_t value_loaded = cpu_load8(cpu->inter, address);
     // Sign-extend the 8-bit value to 32 bits
     uint32_t value_sign_extended = (uint32_t)(int32_t)(int8_t)value_loaded;
     // Schedule load for delay slot
@@ -387,7 +389,7 @@ void op_lbu(Cpu* cpu, uint32_t instruction) {
     uint32_t rt = instr_t(instruction);
     uint32_t rs = instr_s(instruction);
     uint32_t address = cpu_reg(cpu, rs) + offset;
-    uint8_t value_loaded = interconnect_load8(cpu->inter, address);
+    uint8_t value_loaded = cpu_load8(cpu->inter, address);
     // Zero-extend the 8-bit value to 32 bits
     uint32_t value_zero_extended = (uint32_t)value_loaded;
     // Schedule load for delay slot
@@ -607,7 +609,7 @@ void op_lhu(Cpu* cpu, uint32_t instruction) {
         cpu_exception(cpu, EXCEPTION_LOAD_ADDRESS_ERROR);
         return;
     }
-    uint16_t value_loaded = interconnect_load16(cpu->inter, address);
+    uint16_t value_loaded = cpu_load16(cpu->inter, address);
     // Zero-extend the 16-bit value
     uint32_t value_zero_extended = (uint32_t)value_loaded;
     // Schedule load for delay slot
@@ -632,7 +634,7 @@ void op_lh(Cpu* cpu, uint32_t instruction) {
         cpu_exception(cpu, EXCEPTION_LOAD_ADDRESS_ERROR);
         return;
     }
-    uint16_t value_loaded = interconnect_load16(cpu->inter, address);
+    uint16_t value_loaded = cpu_load16(cpu->inter, address);
     // Sign-extend the 16-bit value
     uint32_t value_sign_extended = (uint32_t)(int32_t)(int16_t)value_loaded;
     // Schedule load for delay slot
@@ -833,7 +835,7 @@ return;
                               ? cpu->delay_load_value : cpu->regs[rt];
 
     uint32_t aligned_addr = addr & ~3;
-    uint32_t aligned_word = interconnect_load32(cpu->inter, aligned_addr);
+    uint32_t aligned_word = cpu_load32(cpu->inter, aligned_addr);
     uint32_t merged_value;
 
     // Shift and mask based on address alignment (Little Endian)
@@ -875,7 +877,7 @@ return;
                               ? cpu->delay_load_value : cpu->regs[rt];
 
     uint32_t aligned_addr = addr & ~3;
-    uint32_t aligned_word = interconnect_load32(cpu->inter, aligned_addr);
+    uint32_t aligned_word = cpu_load32(cpu->inter, aligned_addr);
     uint32_t merged_value;
 
     // Shift and mask based on address alignment (Little Endian)
@@ -967,7 +969,7 @@ void op_lwc2(Cpu* cpu, uint32_t instruction) {
     uint32_t rs     = instr_s(instruction);           // base address register
     uint32_t offset = instr_imm_se(instruction);
     uint32_t addr   = cpu_reg(cpu, rs) + offset;
-    uint32_t value  = interconnect_load32(cpu->inter, addr);
+    uint32_t value  = cpu_load32(cpu->inter, addr);
     gte_write_data_register(&cpu->gte, rt, value);
 }
 

@@ -30,7 +30,10 @@
  * top of the 2 MB VRAM-viewer snapshot and any full-VRAM upload, so both the
  * update count and the staging pool have to carry a whole frame's worth or
  * the tail of every frame is dropped ("VRAM pool full — skipping rect"). */
-#define GPU_MAX_VRAM_UPDATES   1024
+/* Fills are VRAM writes pushed as uploads (up to four pieces each across the
+ * VRAM edges), so a fill-heavy field records far more updates than it used to;
+ * at 16 bytes a record the higher ceiling costs 48 KB per slot. */
+#define GPU_MAX_VRAM_UPDATES   4096
 #define GPU_VRAM_POOL_SIZE     (16 * 1024 * 1024)  /* 16 MB per slot */
 
 typedef struct {
@@ -1302,8 +1305,9 @@ void glr_upload_vram(GlRenderer* renderer, const uint16_t* vram_data) {
      * vram_tex. So where the barrier exists (every driver this has run on)
      * this was a 2 MB copy into the pool on the emulation thread and a 2 MB
      * glTexSubImage2D on the GPU thread, once per field from main.c and again
-     * after every fill followed by a textured primitive (gpu_commands.c
-     * upload_vram_if_dirty), for no visible effect; and each one took 2 MB of
+     * after every fill followed by a textured primitive (the former
+     * upload_vram_if_dirty in gpu_commands.c; fills are uploads now), for no
+     * visible effect; and each one took 2 MB of
      * the 16 MB per-slot pool, so a fill-heavy field could run the pool out and
      * drop a real upload with "VRAM pool full". The Vulkan backend reached the
      * same conclusion and makes this call a no-op (vkr_upload_vram). Without
@@ -1743,8 +1747,13 @@ void glr_set_drawing_area(GlRenderer* renderer, uint16_t left, uint16_t top,
     int gl_bot   = (int)((float)(bottom + 1) * sy);
     int clip_w   = gl_right - gl_left;
     int clip_h   = gl_bot   - gl_top;
-    if (clip_w <= 0) clip_w = 1;
-    if (clip_h <= 0) clip_h = 1;
+    /* An area whose right edge is left of its left edge (or bottom above top)
+     * is empty, and the render commands clip "any pixels that are outside of
+     * this region" (psx-spx gpu/rendering-attributes.md:139-140), so nothing is
+     * drawn. A zero-sized scissor is valid in GL and does exactly that; this
+     * used to widen it to a one-pixel column, as the Vulkan backend never did. */
+    if (clip_w < 0) clip_w = 0;
+    if (clip_h < 0) clip_h = 0;
 
     /* Scissor Y is a texel row, and the vertex shader no longer flips Y, so the
      * PSX top edge is the low row — no 512-gl_bot inversion. */

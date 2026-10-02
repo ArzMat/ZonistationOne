@@ -21,7 +21,7 @@
 /* Recording limits, sized like the GL backend's so a frame that fits there fits
  * here and an A/B never diverges because one side dropped work the other kept. */
 #define VKR_MAX_BATCHES      8192
-#define VKR_MAX_VRAM_UPDATES 1024
+#define VKR_MAX_VRAM_UPDATES 4096   /* fills are uploads: see GPU_MAX_VRAM_UPDATES */
 #define VKR_MAX_OPS          (VKR_MAX_BATCHES + VKR_MAX_VRAM_UPDATES)
 #define VKR_VRAM_POOL_SIZE   (16 * 1024 * 1024)
 

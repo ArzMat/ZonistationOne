@@ -111,3 +111,4 @@ cluster-data/
 # Unit test binaries and profile-guided optimisation data
 tests/bin/
 pgo/
+tests/hw/build/

@@ -276,7 +276,7 @@ tests/bin/%: tests/%.c
 ALL_OBJS = $(EMU_OBJS)
 DEPS = $(ALL_OBJS:.o=.d) $(wildcard tests/bin/*.d)
 
-.PHONY: all test clean compile_commands
+.PHONY: all test hwtest clean compile_commands
 
 # `compile_commands` is defined before `all`, and make takes the FIRST real
 # target as the default goal — so a bare `make` regenerated compile_commands.json
@@ -330,11 +330,17 @@ test: $(UNIT_TEST_BINS)
 	@for t in $(UNIT_TEST_BINS); do echo "== $$t"; ./$$t || exit 1; done
 	@echo "all $(words $(UNIT_TEST_BINS)) unit tests passed"
 
+# Bare-metal hardware tests (layer 2): small PS-X EXEs run inside the emulator
+# on a zero-filled BIOS, on both renderers. Needs gcc-mipsel-linux-gnu and
+# xvfb-run; see tests/hw/README.md.
+hwtest: $(EMU_BIN)
+	tests/hw/run.sh ./$(EMU_BIN)
+
 split_log: split_log.c
 	$(CC) -o split_log split_log.c
 
 clean:
-	rm -rf tests/bin
+	rm -rf tests/bin tests/hw/build
 	rm -f $(EMU_BIN) split_log \
 	    src/gpu/shaders/*.spv src/gpu/shaders/*.spv.h \
 	    src/*.[od] src/cpu/*.[od] src/core/*.[od] src/gpu/*.[od] src/gte/*.[od] \

@@ -301,7 +301,11 @@ typedef struct Spu {
     uint32_t noise_count;
     uint32_t noise_level;
 
-    /* Capture buffer */
+    /* Capture buffers. The four of them live in SPU RAM itself, at 000h-FFFh
+     * (soundprocessingunitspu.md:51-62), where a game can read them back with
+     * DMA and where the IRQ address can trap their writes (:836-844). This
+     * private array is no longer written; it stays so sizeof(Spu) does not
+     * move for it. capture_pos is the sample index, 0..1FFh. */
     int16_t  capture_buffer[NUM_CAPTURE_CHANNELS][CAPTURE_BUFFER_SIZE];
     uint32_t capture_pos;
 
@@ -321,7 +325,10 @@ typedef struct Spu {
     int32_t  main_vol_right_cur;
     bool     muted;                  /* SPUCNT.14 = 0: voices muted, CD not */
 
-    /* CD audio frame mixing */
+    /* CD audio input for the current sample, as the CD controller hands it
+     * over: after its Mute/ADPMUTE/ATV output stage, before the SPU's own CD
+     * volume (AVOLL/AVOLR). That is the point the capture buffers record
+     * ("CD Audio before Volume processing", soundprocessingunitspu.md:53-54). */
     int16_t  cd_audio_left;
     int16_t  cd_audio_right;
 

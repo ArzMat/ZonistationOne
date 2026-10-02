@@ -67,15 +67,26 @@ static void noise_tick(Spu* spu) {
  * Capture Buffer
  * ========================================================================= */
 
-static void capture_write(Spu* spu, int channel, int16_t value) {
-    spu->capture_buffer[channel][spu->capture_pos] = value;
+/* The four capture buffers are the first 4 KB of SPU RAM itself
+ * (psx-spx spu/soundprocessingunitspu.md:51-62): CD left at 000h, CD right at
+ * 400h, voice 1 at 800h, voice 3 at C00h, 200h signed 16-bit samples each
+ * (:839), one per 44.1 kHz tick. They used to go to a private array no game
+ * could read back, and nothing could trap them: with the IRQ address inside
+ * 0000h-01FFh (byte address 000h-FFFh) every write is an access that raises
+ * IRQ9 (:836-844), which is how lip-sync and capture-driven effects are timed
+ * (:861-865). RAM_CTRL always reads 0004h here, so the "bit3-2 both zero"
+ * exception at :844 never applies. */
+static void capture_write(Spu* spu, struct Interconnect* inter, int channel, int16_t value) {
+    uint32_t byte_addr = (uint32_t)channel * 0x400u + (spu->capture_pos & 0x1FFu) * 2u;
+    spu->ram[byte_addr >> 1] = (uint16_t)value;
+    spu_check_irq(spu, inter, byte_addr);
 }
 
 static void capture_increment(Spu* spu) {
-    spu->capture_pos += 2;
-    spu->capture_pos %= CAPTURE_BUFFER_SIZE;
+    spu->capture_pos = (spu->capture_pos + 1u) & 0x1FFu;
+    /* SPUSTAT.11: first or second half of the buffers (:650, :661-663). */
     spu->status = (spu->status & ~SPU_STATUS_CB_HALF) |
-        ((spu->capture_pos >= 0x200) ? SPU_STATUS_CB_HALF : 0);
+        ((spu->capture_pos >= 0x100) ? SPU_STATUS_CB_HALF : 0);
 }
 
 /* =========================================================================
@@ -379,19 +390,29 @@ static void spu_generate_one_sample(Spu* spu, struct Interconnect* inter, int16_
     if (s_no_cdaudio < 0) s_no_cdaudio = getenv("ZS1_SPU_NO_CDAUDIO") ? 1 : 0;
 
     if (!s_no_cdaudio && (spu->control & SPU_CTRL_CD_AUDIO_EN)) {
-        mix_l = clamp16(mix_l + (int32_t)spu->cd_audio_left);
-        mix_r = clamp16(mix_r + (int32_t)spu->cd_audio_right);
+        /* AVOLL/AVOLR, signed, "-8000h..+7FFFh" (:437-443). A volume of 0 is
+         * silence: it used to be taken as "uninitialised" and played at full
+         * volume, so a game that faded the CD down to 0 for a scene change kept
+         * hearing the tail of the old line. No power-on value is documented;
+         * the documented setup has the software write this register before
+         * any CD audio (psx-spx cdr/cdromdrive.md:352-354, :1014-1016), and
+         * spu_step logs once if CD frames arrive while it is still 0. */
+        int32_t cd_l = ((int32_t)spu->cd_audio_left  * (int32_t)spu->cd_vol_left)  >> 15;
+        int32_t cd_r = ((int32_t)spu->cd_audio_right * (int32_t)spu->cd_vol_right) >> 15;
+        mix_l = clamp16(mix_l + cd_l);
+        mix_r = clamp16(mix_r + cd_r);
         if (spu->control & SPU_CTRL_CD_REVERB) {
-            rev_in_l = clamp16(rev_in_l + (int32_t)spu->cd_audio_left);
-            rev_in_r = clamp16(rev_in_r + (int32_t)spu->cd_audio_right);
+            rev_in_l = clamp16(rev_in_l + cd_l);
+            rev_in_r = clamp16(rev_in_r + cd_r);
         }
     }
 
-    /* Write capture buffer */
-    capture_write(spu, 0, spu->cd_audio_left);
-    capture_write(spu, 1, spu->cd_audio_right);
-    capture_write(spu, 2, (int16_t)spu->voices[1].sval);
-    capture_write(spu, 3, (int16_t)spu->voices[3].sval);
+    /* Capture buffers, in SPU RAM: CD input before the volume (:53-54), voices
+     * 1 and 3 after the ADSR (:55-56), whether or not they are audible (:841-843). */
+    capture_write(spu, inter, 0, spu->cd_audio_left);
+    capture_write(spu, inter, 1, spu->cd_audio_right);
+    capture_write(spu, inter, 2, (int16_t)spu->voices[1].sval);
+    capture_write(spu, inter, 3, (int16_t)spu->voices[3].sval);
     capture_increment(spu);
 
     /* Noise tick */
@@ -511,8 +532,7 @@ void spu_step(struct Interconnect* inter, uint32_t cpu_cycles) {
         spu->spu_tick_counter -= CPU_TICKS_PER_SPU_TICK;
 
         /* Feed one CDROM audio sample into SPU CD inputs.
-         * The CDROM audio FIFO holds XA/CDDA at 44100 Hz stereo.
-         * cd_vol_left/right are PSX-standard 15-bit signed scale factors. */
+         * The CDROM audio FIFO holds XA/CDDA at 44100 Hz stereo. */
         {
             /* Hold the last CD sample when the FIFO has nothing, rather than
              * falling to zero.
@@ -544,16 +564,28 @@ void spu_step(struct Interconnect* inter, uint32_t cpu_cycles) {
                 cdrom_audio_fifo_pop(&inter->cdrom.audio_fifo, &cl, &cr);
                 s_cd_last_l = cl;
                 s_cd_last_r = cr;
+                static bool s_avol_zero_logged = false;
+                if (!s_avol_zero_logged && (spu->control & SPU_CTRL_CD_AUDIO_EN) &&
+                    spu->cd_vol_left == 0 && spu->cd_vol_right == 0) {
+                    s_avol_zero_logged = true;
+                    LOG_SPU_INFO("[SPU] CD audio is arriving with the CD input volume "
+                                 "(AVOLL/AVOLR, 1F801DB0h/DB2h) at 0: silent until the "
+                                 "guest writes it");
+                }
             } else {
                 inter->cdrom.audio_fifo.total_starved++;
             }
-            /* Apply CD input volume (cd_vol default 0x7FFF = full) */
-            int32_t cv_l = (int32_t)(int16_t)spu->cd_vol_left;
-            int32_t cv_r = (int32_t)(int16_t)spu->cd_vol_right;
-            /* If cd_vol is 0 (uninitialised), treat as full volume so CDDA is audible */
-            if (cv_l == 0 && cv_r == 0) { cv_l = 0x7FFF; cv_r = 0x7FFF; }
-            spu->cd_audio_left  = (int16_t)(((int32_t)cl * cv_l) >> 15);
-            spu->cd_audio_right = (int16_t)(((int32_t)cr * cv_r) >> 15);
+            /* The CD controller's output stage: Mute, ADPMUTE and the ATV
+             * matrix (psx-spx cdr/cdromdrive.md:225-255, :1019-1022). It sits
+             * in the drive, ahead of the SPU, and it used to be dead code: the
+             * one function that applied it had no caller once the SPU started
+             * reading this FIFO directly. Applied after the hold above, so a
+             * Mute silences a held sample too. The SPU's own CD volume
+             * (AVOLL/AVOLR) comes after, in spu_generate_one_sample, past the
+             * capture point. */
+            cdrom_apply_output_volume(&inter->cdrom, &cl, &cr);
+            spu->cd_audio_left  = cl;
+            spu->cd_audio_right = cr;
         }
 
         /* Generate one stereo sample */

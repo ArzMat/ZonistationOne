@@ -78,6 +78,43 @@ void dma_channel_progress(DmaChannel* ch, uint32_t next_addr, uint32_t remaining
     }
 }
 
+/* Channels whose MADR or BCR the guest wrote while their sliced transfer was
+ * still running here.
+ *
+ * Our slices can still be running when the guest believes the transfer is
+ * over and sets up the next one: the drain in interconnect_perform_dma exists
+ * because FMV players do exactly that. A slice event that fires between the
+ * guest's MADR write and its CHCR write would then overwrite the new MADR with
+ * the old transfer's progress, and the next transfer would start from the
+ * wrong place. So once the guest has written either register during a
+ * transfer, that transfer stops writing them back; the guest's values win.
+ * Not part of the saved state: it only matters inside one transfer, and the
+ * next start clears it. */
+static uint8_t s_guest_regs_during_transfer = 0;
+
+static bool dma_slice_running(const Dma* dma, uint32_t channel) {
+    switch (channel) {
+        case 0:  return dma->mdec_in_active;
+        case 1:  return dma->mdec_out_active;
+        case 2:  return dma->gpu_ll_active || dma->gpu_req_active;
+        default: return false;
+    }
+}
+
+void dma_writeback_begin(uint32_t channel) {
+    if (channel < 7) s_guest_regs_during_transfer &= (uint8_t)~(1u << channel);
+}
+
+void dma_writeback(Dma* dma, uint32_t channel, uint32_t next_addr, uint32_t remaining) {
+    if (channel >= 7 || (s_guest_regs_during_transfer & (1u << channel))) return;
+    dma_channel_progress(&dma->channels[channel], next_addr, remaining);
+}
+
+void dma_writeback_list(Dma* dma, uint32_t channel, uint32_t madr) {
+    if (channel >= 7 || (s_guest_regs_during_transfer & (1u << channel))) return;
+    dma->channels[channel].base_addr = madr & 0x00FFFFFFu;
+}
+
 // Helper function to set channel control register value
 // REMOVED 'static'
 void channel_set_control(DmaChannel* ch, uint32_t value) {
@@ -217,6 +254,7 @@ dma->inter = inter; // Store pointer to Interconnect
     dma->mdec_out_remaining = 0;
     dma->mdec_out_step      = 4;
     dma->mdec_out_active    = false;
+    s_guest_regs_during_transfer = 0;
 
     LOG_DMA_INFO("[DMA] DMA Initialized. DPCR=0x%08x, Channels initialized.", dma->control);
 }
@@ -274,10 +312,14 @@ bool dma_write(Dma* dma, uint32_t offset, uint32_t value) {
         switch (register_offset) {
             case 0x0: // MADR
                 ch->base_addr = value & 0x00FFFFFF;
+                if (dma_slice_running(dma, channel_index))
+                    s_guest_regs_during_transfer |= (uint8_t)(1u << channel_index);
                 break;
             case 0x4: // BCR
                 ch->block_size = (uint16_t)(value & 0xFFFF);
                 ch->block_count = (uint16_t)(value >> 16);
+                if (dma_slice_running(dma, channel_index))
+                    s_guest_regs_during_transfer |= (uint8_t)(1u << channel_index);
                 break;
             case 0x8: // CHCR
                 channel_set_control(ch, value);

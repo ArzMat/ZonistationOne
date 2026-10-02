@@ -6,8 +6,8 @@
  * components of this project that have other authors.
  */
 /*
- * dma_test.c - unit test for dma_channel_progress() in src/core/dma.c, the
- * MADR/BCR writeback of psx-spx ps1/system/dmachannels.md:
+ * dma_test.c - unit test for dma_channel_progress() and dma_writeback() in
+ * src/core/dma.c, the MADR/BCR writeback of psx-spx ps1/system/dmachannels.md:
  *   :23-29  SyncMode 0 leaves MADR alone unless chopping is on; SyncMode 1
  *           holds the start of the current block, then the end address
  *   :30-32  MADR bits 0-1 keep whatever was written
@@ -105,6 +105,34 @@ int main(void) {
     ch = chan(REQUEST, 0xFFFFF0, 4, 1, false, false);
     dma_channel_progress(&ch, 0x1000000, 0);
     CHECK(ch.base_addr == 0, "24-bit wrap: MADR %08x", ch.base_addr);
+
+    /* The guard: a MADR the guest writes while its channel's sliced transfer
+     * is still running here is not overwritten by that transfer's progress,
+     * and the next transfer start re-arms the writeback. */
+    static Dma dma;
+    dma_init(&dma, NULL);
+    dma.channels[0] = chan(REQUEST, 0x3000, 32, 4, false, false);
+    dma.mdec_in_active = true;
+    dma_writeback_begin(0);
+    dma_writeback(&dma, 0, 0x3000 + 40 * 4, 88);
+    CHECK(dma.channels[0].base_addr == 0x3080 && dma.channels[0].block_count == 3,
+          "writeback while running: MADR %06x BA %u, want 003080h 3",
+          dma.channels[0].base_addr, dma.channels[0].block_count);
+    dma_write(&dma, 0x00, 0x5000);                  /* guest sets up the next one early */
+    dma_writeback(&dma, 0, 0x3000 + 60 * 4, 68);
+    CHECK(dma.channels[0].base_addr == 0x5000, "the guest's MADR was overwritten: %06x",
+          dma.channels[0].base_addr);
+    dma_writeback_list(&dma, 0, 0xFFFFFF);
+    CHECK(dma.channels[0].base_addr == 0x5000, "the guest's MADR was overwritten by a list end");
+    dma.mdec_in_active = false;
+    dma_writeback_begin(0);                         /* the next transfer starts */
+    dma_writeback(&dma, 0, 0x5000 + 4, 0);
+    CHECK(dma.channels[0].base_addr == 0x5004, "writeback not re-armed by the next start: %06x",
+          dma.channels[0].base_addr);
+    dma_write(&dma, 0x04, 0x00020010);              /* BCR with nothing running: no guard */
+    dma_writeback(&dma, 0, 0x6000, 0);
+    CHECK(dma.channels[0].base_addr == 0x6000 && dma.channels[0].block_count == 0,
+          "a register write with no transfer running must not block the writeback");
 
     printf("dma_test: %d checks, %d failed\n", g_checks, g_fail);
     return g_fail ? 1 : 0;

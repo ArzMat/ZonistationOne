@@ -122,6 +122,14 @@ void dma_cancel_slice(Dma* dma, uint32_t channel_index);
  * the caller's: MADR holds the current node, then the end marker. */
 void dma_channel_progress(DmaChannel* ch, uint32_t next_addr, uint32_t remaining);
 
+/* The same, for a transfer in progress on `channel`, unless the guest has
+ * written that channel's MADR or BCR since the transfer started (see dma.c).
+ * dma_writeback_list() is the SyncMode 2 form: MADR = the next node, then the
+ * end marker. dma_writeback_begin() is called when a transfer starts. */
+void dma_writeback(Dma* dma, uint32_t channel, uint32_t next_addr, uint32_t remaining);
+void dma_writeback_list(Dma* dma, uint32_t channel, uint32_t madr);
+void dma_writeback_begin(uint32_t channel);
+
 uint32_t channel_get_control(DmaChannel* ch);
 void channel_set_control(DmaChannel* ch, uint32_t value);
 

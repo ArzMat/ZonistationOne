@@ -1039,13 +1039,12 @@ void dma_gpu_resume(struct Interconnect* inter) {
     dma_doc_busy_for(inter, dma_ram_ticks(words));
 
     /* MADR follows the list: the node the next slice starts from, then the end
-     * marker (dmachannels.md:27-29). SyncMode 1 through dma_channel_progress. */
-    DmaChannel* ch2 = &inter->dma.channels[2];
+     * marker (dmachannels.md:27-29). SyncMode 1 through dma_writeback. */
     if (was_ll)
-        ch2->base_addr = inter->dma.gpu_ll_addr & 0x00FFFFFFu;
+        dma_writeback_list(&inter->dma, 2, inter->dma.gpu_ll_addr);
     else if (was_req)
-        dma_channel_progress(ch2, inter->dma.gpu_req_addr,
-                             inter->dma.gpu_req_active ? inter->dma.gpu_req_remaining : 0u);
+        dma_writeback(&inter->dma, 2, inter->dma.gpu_req_addr,
+                      inter->dma.gpu_req_active ? inter->dma.gpu_req_remaining : 0u);
     if (done) {
         dma_ch2_signal_done(inter);
     } else {
@@ -1146,11 +1145,11 @@ void dma_mdec_resume(struct Interconnect* inter) {
     dma_doc_busy_for(inter, dma_ram_ticks(words));
     /* MADR/BCR move with the transfer (dmachannels.md:27-29, :56-58). */
     if (was_in)
-        dma_channel_progress(&inter->dma.channels[0], inter->dma.mdec_in_addr,
-                             inter->dma.mdec_in_active ? inter->dma.mdec_in_remaining : 0u);
+        dma_writeback(&inter->dma, 0, inter->dma.mdec_in_addr,
+                      inter->dma.mdec_in_active ? inter->dma.mdec_in_remaining : 0u);
     if (was_out)
-        dma_channel_progress(&inter->dma.channels[1], inter->dma.mdec_out_addr,
-                             inter->dma.mdec_out_active ? inter->dma.mdec_out_remaining : 0u);
+        dma_writeback(&inter->dma, 1, inter->dma.mdec_out_addr,
+                      inter->dma.mdec_out_active ? inter->dma.mdec_out_remaining : 0u);
     if (was_in  && !inter->dma.mdec_in_active)  dma_mdec_signal_done(inter, 0);
     if (was_out && !inter->dma.mdec_out_active) dma_mdec_signal_done(inter, 1);
     if (!done) {
@@ -1219,8 +1218,9 @@ static void interconnect_perform_dma(Interconnect* inter, uint32_t channel_index
             return;
         }
         LOG_DMA_DEBUG("[DMA] ch2 kick while slice in flight — draining first");
-        /* No MADR/BCR writeback for the drained transfer: the guest has just
-         * written the registers for the new one. */
+        /* No MADR/BCR writeback for the drained transfer (dma_gpu_run_slice
+         * does not do it): the guest has just written the registers for the
+         * new one. */
         uint32_t guard = 0, drained = 0, w = 0;
         while (!dma_gpu_run_slice(inter, &w) && ++guard < 65536) drained += w;
         drained += w;
@@ -1231,6 +1231,7 @@ static void interconnect_perform_dma(Interconnect* inter, uint32_t channel_index
     }
 
     LOG_DMA_DEBUG("[DMA] ch%d start", channel_index);
+    dma_writeback_begin(channel_index);
     DmaChannel* ch = &inter->dma.channels[channel_index];
     DmaSync sync_mode = ch->sync;
     /* Generic path: where the transfer stopped, for the MADR/BCR writeback. */
@@ -1291,7 +1292,7 @@ static void interconnect_perform_dma(Interconnect* inter, uint32_t channel_index
                     cur_addr = (uint32_t)((int32_t)cur_addr + step);
                 }
                 dma_doc_busy_for(inter, dma_ram_ticks(moved));
-                dma_channel_progress(ch, cur_addr, words_to_transfer - moved);
+                dma_writeback(&inter->dma, 2, cur_addr, words_to_transfer - moved);
                 dma_ch2_signal_done(inter);
                 return;
             }
@@ -1396,7 +1397,8 @@ static void interconnect_perform_dma(Interconnect* inter, uint32_t channel_index
 
     /* After the stall above, which reads BCR for its word count. */
     if (have_progress)
-        dma_channel_progress(ch, next_addr, dma_get_transfer_size_words(ch) - moved_words);
+        dma_writeback(&inter->dma, channel_index, next_addr,
+                      dma_get_transfer_size_words(ch) - moved_words);
 
     // DMA completion IRQ (IRQ3)
     if (inter->dma.channel_irq_enable & (1u << channel_index)) {

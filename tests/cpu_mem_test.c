@@ -5,13 +5,19 @@
  * See LICENSE for the full licence text and THIRD-PARTY.md for the
  * components of this project that have other authors.
  */
-/* include/cpu_mem.h: the CPU's RAM fast path.
+/* include/cpu_mem.h: the CPU's RAM fast path and the SWL/SWR helpers.
  *
  * The fast path must take exactly the accesses bus.c would have served as a
  * plain RAM read (aligned, main RAM or a mirror of it, no read watchpoint) and
  * charge exactly the same stall; everything else has to reach the unchanged
  * interconnect_load*() call. The bus is stubbed here so each fallback is
- * counted. */
+ * counted.
+ *
+ * SWL/SWR are checked against the table in psx-spx
+ * ps1/cpu/cpuspecifications.md:270-282, rebuilt independently from the doc's
+ * wording ("transfer upper N bits of Rt to [N*4+0..k]", "lower N bits to
+ * [N*4+k..3]", the other bytes intact), for all four alignments and a spread of
+ * values, both as a merged word and as the byte/halfword store plan. */
 #include "log.h"
 #include "cpu_mem.h"
 
@@ -60,6 +66,37 @@ static void expect_slow32(uint32_t addr) {
     uint32_t v = cpu_load32(&g_inter, addr);
     CHECK(g_slow32 == slow + 1 && v == 0xDEADBEEFu, "load32 %08X did not fall back", addr);
     CHECK(g_inter.cpu_mem_stall_cycles == stall, "load32 %08X charged on the fast path", addr);
+}
+
+/* psx-spx's table, as words: byte j of the aligned word after the store. */
+static uint32_t doc_swl(uint32_t mem, uint32_t rt, uint32_t k) {
+    uint32_t out = mem;
+    for (uint32_t j = 0; j <= k; j++) {               /* [N*4+0..k] <- upper (k+1) bytes */
+        uint32_t byte = (rt >> (8u * (3u - k + j))) & 0xFFu;
+        out = (out & ~(0xFFu << (8u * j))) | (byte << (8u * j));
+    }
+    return out;
+}
+static uint32_t doc_swr(uint32_t mem, uint32_t rt, uint32_t k) {
+    uint32_t out = mem;
+    for (uint32_t j = k; j <= 3; j++) {               /* [N*4+k..3] <- lower (4-k) bytes */
+        uint32_t byte = (rt >> (8u * (j - k))) & 0xFFu;
+        out = (out & ~(0xFFu << (8u * j))) | (byte << (8u * j));
+    }
+    return out;
+}
+
+static uint32_t apply_plan(uint32_t mem, CpuPartialStore p) {
+    uint8_t b[4] = { (uint8_t)mem, (uint8_t)(mem >> 8), (uint8_t)(mem >> 16), (uint8_t)(mem >> 24) };
+    for (uint32_t i = 0; i < p.count; i++) {
+        CHECK(p.size[i] == 1 || p.size[i] == 2 || p.size[i] == 4, "plan size %u", p.size[i]);
+        CHECK(p.off[i] % p.size[i] == 0, "plan store at +%u size %u is not naturally aligned",
+              p.off[i], p.size[i]);
+        CHECK(p.off[i] + p.size[i] <= 4, "plan store leaves the word");
+        for (uint32_t j = 0; j < p.size[i] && p.off[i] + j < 4; j++)
+            b[p.off[i] + j] = (uint8_t)(p.value[i] >> (8u * j));
+    }
+    return (uint32_t)b[0] | ((uint32_t)b[1] << 8) | ((uint32_t)b[2] << 16) | ((uint32_t)b[3] << 24);
 }
 
 int main(void) {
@@ -118,6 +155,41 @@ int main(void) {
         CHECK(g_inter.cpu_mem_stall_cycles == stall, "stall 0 still charged");
     }
     g_bus_ram_load_stall = 3;
+
+    /* --- SWL/SWR against the psx-spx table --- */
+    {
+        /* The doc's own wording, one fixed case per alignment, spelled out. */
+        const uint32_t mem = 0x11223344u, rt = 0xAABBCCDDu;
+        static const uint32_t want_swl[4] = { 0x112233AAu, 0x1122AABBu, 0x11AABBCCu, 0xAABBCCDDu };
+        static const uint32_t want_swr[4] = { 0xAABBCCDDu, 0xBBCCDD44u, 0xCCDD3344u, 0xDD223344u };
+        for (uint32_t k = 0; k < 4; k++) {
+            CHECK(doc_swl(mem, rt, k) == want_swl[k], "doc_swl +%u", k);
+            CHECK(doc_swr(mem, rt, k) == want_swr[k], "doc_swr +%u", k);
+            CHECK(cpu_swl_merge(mem, rt, k) == want_swl[k], "swl merge +%u = %08X", k, cpu_swl_merge(mem, rt, k));
+            CHECK(cpu_swr_merge(mem, rt, k) == want_swr[k], "swr merge +%u = %08X", k, cpu_swr_merge(mem, rt, k));
+            CHECK(apply_plan(mem, cpu_swl_plan(rt, k)) == want_swl[k], "swl plan +%u", k);
+            CHECK(apply_plan(mem, cpu_swr_plan(rt, k)) == want_swr[k], "swr plan +%u", k);
+        }
+        /* And a spread of values: merge, plan and table must agree. */
+        uint32_t x = 0x12345678u;
+        for (int n = 0; n < 2000; n++) {
+            x = x * 1664525u + 1013904223u; uint32_t m = x;
+            x = x * 1664525u + 1013904223u; uint32_t r = x;
+            for (uint32_t k = 0; k < 4; k++) {
+                uint32_t wl = doc_swl(m, r, k), wr = doc_swr(m, r, k);
+                if (cpu_swl_merge(m, r, k) != wl || apply_plan(m, cpu_swl_plan(r, k)) != wl ||
+                    cpu_swr_merge(m, r, k) != wr || apply_plan(m, cpu_swr_plan(r, k)) != wr) {
+                    failures++;
+                    printf("FAIL mem %08X rt %08X +%u\n", m, r, k);
+                }
+                checks++;
+            }
+        }
+        /* A store plan writes exactly the bytes the table names: a full-word
+         * case is one store, the others never touch the bytes they keep. */
+        CHECK(cpu_swl_plan(rt, 3).count == 1 && cpu_swl_plan(rt, 3).size[0] == 4, "swl +3 is one word store");
+        CHECK(cpu_swr_plan(rt, 0).count == 1 && cpu_swr_plan(rt, 0).size[0] == 4, "swr +0 is one word store");
+    }
 
     printf("cpu_mem_test: %d checks, %d failures\n", checks, failures);
     return failures ? 1 : 0;

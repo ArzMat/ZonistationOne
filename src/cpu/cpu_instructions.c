@@ -893,6 +893,57 @@ return;
     cpu->load_value = merged_value;
 }
 
+/* SWL / SWR: one partial store, no read.
+ *
+ * These used to read the aligned word with interconnect_load32(), merge, and
+ * write it back with interconnect_store32(). Hardware does not read anything:
+ * the CPU drives four byte-enable lines, so "within a 32bit location, it can
+ * transfer all fragments of Rt at once ... the other 24bit of Rt and [mem]
+ * will remain intact" (psx-spx ps1/cpu/cpuspecifications.md:284-287), and a
+ * store goes to the write queue (:224-227). The read cost two things:
+ *   - on RAM, a load stall (bus_charge_cpu_load, 3 cycles by default) that a
+ *     store never pays, so every SWL/SWR ran slower than the instruction does;
+ *   - on anything else, a real bus read, which on an I/O register is a side
+ *     effect (a FIFO pop, an acknowledge), and a read watchpoint hit for an
+ *     access that never happened.
+ *
+ * Now: on RAM the bytes that stay are read straight out of RAM (they are only
+ * needed to build the word; nothing on the bus sees that read), and the merged
+ * word goes through interconnect_store32() exactly as before, so the store
+ * stall, the write watchpoints and the RAM write are the bus's own. Off RAM,
+ * the transfer is split into the naturally aligned byte/halfword/word stores
+ * that cover exactly the bytes the table names (cpu_swl_plan/cpu_swr_plan in
+ * cpu_mem.h), and nothing is read at all.
+ *
+ * The cache-isolation early return is unchanged. */
+static void cpu_store_partial(Cpu* cpu, uint32_t addr, uint32_t value, bool left) {
+    Interconnect* inter = cpu->inter;
+    const uint32_t aligned_addr = addr & ~3u;
+    const uint32_t byte_off     = addr & 3u;
+    const uint32_t phys         = bus_mask_region(aligned_addr);
+
+    if (phys < CPU_MEM_RAM_WINDOW_END) {
+        const uint8_t* p = &inter->ram->data[phys & (RAM_SIZE - 1)];
+        uint32_t mem = (uint32_t)p[0] | ((uint32_t)p[1] << 8) |
+                       ((uint32_t)p[2] << 16) | ((uint32_t)p[3] << 24);
+        uint32_t merged = left ? cpu_swl_merge(mem, value, byte_off)
+                               : cpu_swr_merge(mem, value, byte_off);
+        interconnect_store32(inter, aligned_addr, merged);
+        return;
+    }
+
+    CpuPartialStore plan = left ? cpu_swl_plan(value, byte_off)
+                                : cpu_swr_plan(value, byte_off);
+    for (uint32_t i = 0; i < plan.count; i++) {
+        uint32_t a = aligned_addr + plan.off[i];
+        switch (plan.size[i]) {
+            case 1:  interconnect_store8(inter, a, (uint8_t)plan.value[i]);   break;
+            case 2:  interconnect_store16(inter, a, (uint16_t)plan.value[i]); break;
+            default: interconnect_store32(inter, a, plan.value[i]);           break;
+        }
+    }
+}
+
 // Store Word Left (Handles unaligned stores)
 void op_swl(Cpu* cpu, uint32_t instruction) {
      if ((cpu->sr & 0x10000) != 0) {
@@ -903,21 +954,7 @@ return;
     uint32_t rs = instr_s(instruction); // Register containing base address
     uint32_t addr = cpu_reg(cpu, rs) + offset;
     uint32_t value_to_store = cpu_reg(cpu, rt); // Use input register set value
-
-    uint32_t aligned_addr = addr & ~3;
-    // Read-Modify-Write the aligned word in memory
-    uint32_t current_mem_word = interconnect_load32(cpu->inter, aligned_addr);
-    uint32_t modified_mem_word;
-
-    // Shift and mask based on address alignment (Little Endian)
-    switch (addr & 3) {
-        case 0: modified_mem_word = (current_mem_word & 0xFFFFFF00) | (value_to_store >> 24); break;
-        case 1: modified_mem_word = (current_mem_word & 0xFFFF0000) | (value_to_store >> 16); break;
-        case 2: modified_mem_word = (current_mem_word & 0xFF000000) | (value_to_store >> 8);  break;
-        case 3: modified_mem_word = (current_mem_word & 0x00000000) | (value_to_store >> 0);  break;
-        default: modified_mem_word = current_mem_word; /* Should not happen */ break;
-    }
-    interconnect_store32(cpu->inter, aligned_addr, modified_mem_word);
+    cpu_store_partial(cpu, addr, value_to_store, true);
 }
 
 // Store Word Right (Handles unaligned stores)
@@ -930,21 +967,7 @@ return;
     uint32_t rs = instr_s(instruction); // Register containing base address
     uint32_t addr = cpu_reg(cpu, rs) + offset;
     uint32_t value_to_store = cpu_reg(cpu, rt); // Use input register set value
-
-    uint32_t aligned_addr = addr & ~3;
-    // Read-Modify-Write
-    uint32_t current_mem_word = interconnect_load32(cpu->inter, aligned_addr);
-    uint32_t modified_mem_word;
-
-    // Shift and mask based on address alignment (Little Endian)
-    switch (addr & 3) {
-        case 0: modified_mem_word = (current_mem_word & 0x00000000) | (value_to_store << 0);  break;
-        case 1: modified_mem_word = (current_mem_word & 0x000000FF) | (value_to_store << 8);  break;
-        case 2: modified_mem_word = (current_mem_word & 0x0000FFFF) | (value_to_store << 16); break;
-        case 3: modified_mem_word = (current_mem_word & 0x00FFFFFF) | (value_to_store << 24); break;
-        default: modified_mem_word = current_mem_word; /* Should not happen */ break;
-    }
-    interconnect_store32(cpu->inter, aligned_addr, modified_mem_word);
+    cpu_store_partial(cpu, addr, value_to_store, false);
 }
 
 // Load Word Coprocessor 0 - Not supported

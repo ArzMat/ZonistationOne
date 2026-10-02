@@ -28,6 +28,8 @@
 
 /* ---- stubs ---------------------------------------------------------------- */
 
+/* The LOG_* macros test this at the call site (include/log.h). */
+LogLevel current_log_level = LOG_LEVEL_INFO;
 void log_print(LogCategory category, LogLevel level, const char* format, ...) {
     (void)category; (void)level; (void)format;
 }

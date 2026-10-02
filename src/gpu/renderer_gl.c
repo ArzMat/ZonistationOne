@@ -1261,7 +1261,26 @@ void glr_get_pool_stats(GlRenderer* renderer, uint32_t* used, uint32_t* peak,
 
 void glr_upload_vram(GlRenderer* renderer, const uint16_t* vram_data) {
     if (!renderer->initialized) return;
+    /* Notified first, unconditionally: scripts that count these keep counting
+     * the same events whether or not anything is copied below. */
     lua_debug_notify("vram_full_upload");
+    /* With the texture barrier nothing reads what this would write.
+     *
+     * A full upload is recorded with update_display=false, so all it ever
+     * reaches is the R16UI mirror (vram_texture), never vram_tex. The mirror
+     * has exactly one reader: glr_draw_gl() binds it for textured batches only
+     * when s_texture_barrier is false. Scanout, the VRAM viewer pass, both
+     * readback paths, the frame dump and the savestate upload all go through
+     * vram_tex. So where the barrier exists (every driver this has run on)
+     * this was a 2 MB copy into the pool on the emulation thread and a 2 MB
+     * glTexSubImage2D on the GPU thread, once per field from main.c and again
+     * after every fill followed by a textured primitive (gpu_commands.c
+     * upload_vram_if_dirty), for no visible effect; and each one took 2 MB of
+     * the 16 MB per-slot pool, so a fill-heavy field could run the pool out and
+     * drop a real upload with "VRAM pool full". The Vulkan backend reached the
+     * same conclusion and makes this call a no-op (vkr_upload_vram). Without
+     * the barrier the path below is unchanged. */
+    if (s_texture_barrier) return;
     glr_record_vram_update(renderer, vram_data, 0, 0, 1024, 512, false);
 }
 
@@ -1960,11 +1979,15 @@ static void glr_execute_one_vram_update(GlRenderer* renderer, const GpuVramUpdat
                         GL_RGBA, GL_UNSIGNED_BYTE, data);
         glBindTexture(GL_TEXTURE_2D, 0);
     } else {
-        /* R16UI VRAM texture upload */
-        glBindTexture(GL_TEXTURE_2D, renderer->vram_texture);
-        glTexSubImage2D(GL_TEXTURE_2D, 0, u->x, u->y, u->w, u->h,
-                        GL_RED_INTEGER, GL_UNSIGNED_SHORT, data);
-        glBindTexture(GL_TEXTURE_2D, 0);
+        /* R16UI VRAM texture upload: the sampling mirror. Only a driver without
+         * the texture barrier samples it (see glr_upload_vram), so with the
+         * barrier this copy fed nothing and is skipped. */
+        if (!s_texture_barrier) {
+            glBindTexture(GL_TEXTURE_2D, renderer->vram_texture);
+            glTexSubImage2D(GL_TEXTURE_2D, 0, u->x, u->y, u->w, u->h,
+                            GL_RED_INTEGER, GL_UNSIGNED_SHORT, data);
+            glBindTexture(GL_TEXTURE_2D, 0);
+        }
 
         /* Write real VRAM writes (GP0 A0 upload, GP0 80 copy, fill) into the
          * unified VRAM texture as 5:5:5:1-expanded RGBA8, so CPU/MDEC content

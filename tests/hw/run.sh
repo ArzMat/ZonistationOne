@@ -19,7 +19,7 @@ cc=${MIPS_CC:-mipsel-linux-gnu-gcc}
 prefix=${cc%gcc}
 backends=${HWTEST_BACKENDS:-gl vulkan}
 timeout_s=${HWTEST_TIMEOUT:-60}
-out=$here/build
+out=${HWTEST_OUT:-$here/build}
 cflags="-march=r3000 -mabi=32 -msoft-float -mno-abicalls -fno-pic -G0 -O2 \
 -ffreestanding -fno-builtin -nostdlib -Wall -Wextra -Wl,--build-id=none"
 

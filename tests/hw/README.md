@@ -17,6 +17,7 @@ sudo apt install gcc-mipsel-linux-gnu xvfb mesa-vulkan-drivers   # once
 make hwtest                         # every suite, OpenGL and Vulkan
 tests/hw/run.sh ./ZoniStation_One gpu spu
 HWTEST_BACKENDS=gl tests/hw/run.sh  # one backend only
+HWTEST_OUT=/tmp/hw tests/hw/run.sh  # build and logs elsewhere (parallel runs)
 ```
 
 Each check rests on a psx-spx line cited next to it. Every check that covers a defect was run

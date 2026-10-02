@@ -35,6 +35,7 @@ uint32_t mask_region(uint32_t addr) {
 // --- Forward declarations ---
 static void interconnect_perform_dma(Interconnect* inter, uint32_t channel_index);
 static uint32_t dma_get_transfer_size_words(DmaChannel* ch);
+static bool dma_slice_in_flight(const Dma* dma, uint32_t channel_index);
 
 // =============================================================================
 // HW DISPATCH TABLE  (indexed by 16-byte block)
@@ -307,10 +308,16 @@ static void hw_dma_write(Interconnect* inter, uint32_t addr, uint32_t val, BusSi
             LOG_DMA_DEBUG("[DMA] ch%u blocked by DPCR", ch);
         }
     } else if (off == 0x70) {
-        // DPCR write: unblock any already-active channels
+        /* DPCR write: start the channels that were waiting for their Master
+         * Enable ("A channel started while its Master Enable is off waits, and
+         * begins when the enable bit is set", psx-spx system/dmachannels.md:
+         * 121-122). A channel whose sliced transfer is already running is not
+         * waiting: it used to be kicked again here, which for GPU DMA drained
+         * the transfer and then started it over from MADR, sending it twice. */
         for (uint32_t i = 0; i < 7; i++) {
             if (((inter->dma.control >> (i * 4 + 3)) & 1u) &&
-                dma_channel_is_active(&inter->dma.channels[i])) {
+                dma_channel_is_active(&inter->dma.channels[i]) &&
+                !dma_slice_in_flight(&inter->dma, i)) {
                 LOG_DMA_DEBUG("[DMA] DPCR write: ch%u unblocked", i);
                 interconnect_perform_dma(inter, i);
             }
@@ -381,7 +388,14 @@ static void hw_gpu_write(Interconnect* inter, uint32_t addr, uint32_t val, BusSi
 
 // --- MDEC (0x1F801820-0x1F80182F) ---
 static uint32_t hw_mdec_read(Interconnect* inter, uint32_t addr, BusSize sz) {
-    uint32_t v32 = mdec_read(&inter->mdec, addr);
+    /* "I/O ports can be read in 8bit, 16bit, or 32bit units, regardless of
+     * their size" (psx-spx system/unpredictablethings.md:58-60): a narrower read
+     * returns its part of the 32-bit register. mdec_read() only knows the two
+     * word addresses, so 1F801822h and 1F801826h read 0 and an lhu of the
+     * status' upper half (busy, DREQ, FIFO flags) always saw "idle". The data
+     * port at 1F801822h now pops a word like 1F801820h already did; whether a
+     * narrow read of it advances the FIFO on hardware is not documented. */
+    uint32_t v32 = mdec_read(&inter->mdec, addr & ~3u);
     if (sz == BUS_WORD)  return v32;
     if (sz == BUS_HWORD) return (uint16_t)(v32 >> ((addr & 2) << 3));
     return (uint8_t)(v32 >> ((addr & 3) << 3));
@@ -831,14 +845,18 @@ static bool dma_gpu_run_slice(Interconnect* inter, uint32_t* words_out) {
             /* FFFFFFh is the clean end marker. Any other address past 8 MB also
              * ends the transfer, but as a bus error the guest can see in DICR
              * (dmachannels.md:186-192) — some games end a chain that way. */
+            /* gpu_ll_addr keeps the marker that ended the list: MADR holds
+             * "the end marker in SyncMode=2" (dmachannels.md:27-29). */
             if (raw_next == 0x00FFFFFFu) {
                 LOG_DMA_TRACE("[DMA] GPU LL done after %u words (sliced)", words_done);
+                dma->gpu_ll_addr   = raw_next;
                 dma->gpu_ll_active = false;
                 return true;
             }
             if (next_addr >= DMA_RAM_LIMIT) {
                 LOG_DMA_DEBUG("[DMA] GPU LL ended on out-of-range next 0x%06x", raw_next);
                 dma_flag_bus_error(dma);
+                dma->gpu_ll_addr   = raw_next;
                 dma->gpu_ll_active = false;
                 return true;
             }
@@ -896,10 +914,21 @@ void dma_gpu_resume(struct Interconnect* inter) {
         const char* v = getenv("ZS1_DMA_GPU_PACE");
         legacy = (v && v[0] == 'l') ? 1 : 0;
     }
+    const bool was_ll  = inter->dma.gpu_ll_active;
+    const bool was_req = inter->dma.gpu_req_active;
     uint32_t words = 0;
     bool done = dma_gpu_run_slice(inter, &words);
     uint32_t ticks = legacy ? DMA_SLICE_CYCLES : (words ? dma_ram_ticks(words) : 1u);
     if (inter->cpu) inter->cpu->downcount -= (int32_t)ticks;
+
+    /* MADR follows the list: the node the next slice starts from, then the end
+     * marker (dmachannels.md:27-29). SyncMode 1 through dma_channel_progress. */
+    DmaChannel* ch2 = &inter->dma.channels[2];
+    if (was_ll)
+        ch2->base_addr = inter->dma.gpu_ll_addr & 0x00FFFFFFu;
+    else if (was_req)
+        dma_channel_progress(ch2, inter->dma.gpu_req_addr,
+                             inter->dma.gpu_req_active ? inter->dma.gpu_req_remaining : 0u);
     if (done) {
         dma_ch2_signal_done(inter);
     } else {
@@ -997,6 +1026,13 @@ void dma_mdec_resume(struct Interconnect* inter) {
     bool was_out = inter->dma.mdec_out_active;
     uint32_t words = 0;
     bool done = dma_mdec_run_slice(inter, &words);
+    /* MADR/BCR move with the transfer (dmachannels.md:27-29, :56-58). */
+    if (was_in)
+        dma_channel_progress(&inter->dma.channels[0], inter->dma.mdec_in_addr,
+                             inter->dma.mdec_in_active ? inter->dma.mdec_in_remaining : 0u);
+    if (was_out)
+        dma_channel_progress(&inter->dma.channels[1], inter->dma.mdec_out_addr,
+                             inter->dma.mdec_out_active ? inter->dma.mdec_out_remaining : 0u);
     if (was_in  && !inter->dma.mdec_in_active)  dma_mdec_signal_done(inter, 0);
     if (was_out && !inter->dma.mdec_out_active) dma_mdec_signal_done(inter, 1);
     if (!done) {
@@ -1065,6 +1101,8 @@ static void interconnect_perform_dma(Interconnect* inter, uint32_t channel_index
             return;
         }
         LOG_DMA_DEBUG("[DMA] ch2 kick while slice in flight — draining first");
+        /* No MADR/BCR writeback for the drained transfer: the guest has just
+         * written the registers for the new one. */
         uint32_t guard = 0;
         while (!dma_gpu_run_slice(inter, NULL) && ++guard < 65536) { /* drain */ }
         if (guard >= 65536)
@@ -1075,6 +1113,9 @@ static void interconnect_perform_dma(Interconnect* inter, uint32_t channel_index
     LOG_DMA_DEBUG("[DMA] ch%d start", channel_index);
     DmaChannel* ch = &inter->dma.channels[channel_index];
     DmaSync sync_mode = ch->sync;
+    /* Generic path: where the transfer stopped, for the MADR/BCR writeback. */
+    bool     have_progress = false;
+    uint32_t moved_words = 0, next_addr = 0;
 
     LOG_DMA_DEBUG("[DMA] ch%d sync=%d dir=%d base=0x%08x",
                   channel_index, sync_mode, ch->direction, ch->base_addr);
@@ -1118,8 +1159,8 @@ static void interconnect_perform_dma(Interconnect* inter, uint32_t channel_index
                 LOG_DMA_DEBUG("[DMA] GPU REQUEST/MANUAL FROM_RAM: %u words", words_to_transfer);
                 inter->dma.gpu_ll_active  = false;
                 inter->dma.gpu_req_active = false;
-                uint32_t cur_addr = addr;
-                for (uint32_t i = 0; i < words_to_transfer; i++) {
+                uint32_t cur_addr = addr, moved = 0;
+                for (; moved < words_to_transfer; moved++) {
                     uint32_t cur = cur_addr & 0x00FFFFFC;
                     if (cur >= DMA_RAM_LIMIT) {
                         LOG_DMA_ERROR("[DMA] GPU req: addr 0x%08x out of bounds", cur);
@@ -1129,6 +1170,7 @@ static void interconnect_perform_dma(Interconnect* inter, uint32_t channel_index
                     gpu_gp0(&inter->gpu, interconnect_load32(inter, cur));
                     cur_addr = (uint32_t)((int32_t)cur_addr + step);
                 }
+                dma_channel_progress(ch, cur_addr, words_to_transfer - moved);
                 dma_ch2_signal_done(inter);
                 return;
             }
@@ -1163,7 +1205,8 @@ static void interconnect_perform_dma(Interconnect* inter, uint32_t channel_index
                           sync_mode == MANUAL ? "MANUAL" : "REQUEST",
                           step, addr, words_to_transfer);
 
-            for (uint32_t i = 0; i < words_to_transfer; ++i) {
+            uint32_t i = 0;
+            for (; i < words_to_transfer; ++i) {
                 uint32_t cur = addr & 0x00FFFFFC;
                 if (cur >= DMA_RAM_LIMIT) {
                     LOG_DMA_ERROR("[DMA] ch%d addr 0x%08x out of RAM", channel_index, cur);
@@ -1203,6 +1246,9 @@ static void interconnect_perform_dma(Interconnect* inter, uint32_t channel_index
                 addr = (uint32_t)((int32_t)addr + step);
             }
             LOG_DMA_DEBUG("[DMA] ch%d transfer complete: %u words", channel_index, words_to_transfer);
+            moved_words   = i;
+            next_addr     = addr;
+            have_progress = true;
             break;
         }
 
@@ -1225,6 +1271,10 @@ static void interconnect_perform_dma(Interconnect* inter, uint32_t channel_index
         uint32_t stall = words * rate + ((words + 15u) / 16u) * 17u;
         inter->cpu->downcount -= (int32_t)stall;
     }
+
+    /* After the stall above, which reads BCR for its word count. */
+    if (have_progress)
+        dma_channel_progress(ch, next_addr, dma_get_transfer_size_words(ch) - moved_words);
 
     // DMA completion IRQ (IRQ3)
     if (inter->dma.channel_irq_enable & (1u << channel_index)) {

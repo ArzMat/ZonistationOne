@@ -44,6 +44,40 @@ void dma_cancel_slice(Dma* dma, uint32_t channel_index) {
     LOG_DMA_DEBUG("[DMA] ch%u sliced transfer cancelled by CHCR write", channel_index);
 }
 
+/* MADR and BCR are not fixed for the length of a transfer. "In SyncMode=1 and
+ * SyncMode=2, the hardware does update MADR (it will contain the start address
+ * of the currently transferred block; at transfer end, it'll hold the
+ * end-address in SyncMode=1, or the end marker in SyncMode=2)"; in SyncMode 0
+ * it does not, "unless Chopping is enabled" (psx-spx system/dmachannels.md:
+ * 23-29). "SyncMode=1 decrements BA to zero, SyncMode=0 with chopping enabled
+ * decrements BC to zero" (:56-58).
+ *
+ * They used to keep the values the guest wrote, so a player that queues the
+ * next block by setting only CHCR again, relying on MADR having moved on,
+ * re-sent the previous data. Bits 0-1 of MADR are kept as written (:30-32). */
+void dma_channel_progress(DmaChannel* ch, uint32_t next_addr, uint32_t remaining) {
+    switch (ch->sync) {
+        case REQUEST: {
+            const uint64_t bs = ch->block_size ? ch->block_size : 0x10000u;
+            const uint64_t blocks_left = ((uint64_t)remaining + bs - 1u) / bs;
+            /* Words of the current block already moved. */
+            const uint32_t done = (uint32_t)(blocks_left * bs - remaining);
+            const int32_t  step = (ch->step == INCREMENT) ? 4 : -4;
+            const uint32_t madr = (uint32_t)((int32_t)next_addr - step * (int32_t)done);
+            ch->base_addr   = (madr & 0x00FFFFFCu) | (ch->base_addr & 3u);
+            ch->block_count = (uint16_t)blocks_left;   /* 10000h blocks reads as 0, as written */
+            break;
+        }
+        case MANUAL:
+            if (!ch->chopping) break;
+            ch->base_addr  = (next_addr & 0x00FFFFFCu) | (ch->base_addr & 3u);
+            ch->block_size = (uint16_t)remaining;
+            break;
+        default:
+            break;
+    }
+}
+
 // Helper function to set channel control register value
 // REMOVED 'static'
 void channel_set_control(DmaChannel* ch, uint32_t value) {

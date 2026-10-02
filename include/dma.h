@@ -112,6 +112,16 @@ void dma_channel_done(DmaChannel* ch);
 /* Drop a sliced transfer still in flight on this channel (CHCR start cleared) */
 void dma_cancel_slice(Dma* dma, uint32_t channel_index);
 
+/* Write a SyncMode 0/1 transfer's progress back into MADR and BCR, as the
+ * hardware does (psx-spx system/dmachannels.md:23-29, :56-58). next_addr is the
+ * address of the next word the transfer would move, remaining the words it has
+ * not moved yet; 0 remaining is the end of the transfer. SyncMode 1 leaves MADR
+ * at the start of the current block and BA at the blocks not finished (both
+ * reach the end address and 0); SyncMode 0 changes nothing unless chopping is
+ * on, in which case MADR follows the address and BC counts down. SyncMode 2 is
+ * the caller's: MADR holds the current node, then the end marker. */
+void dma_channel_progress(DmaChannel* ch, uint32_t next_addr, uint32_t remaining);
+
 uint32_t channel_get_control(DmaChannel* ch);
 void channel_set_control(DmaChannel* ch, uint32_t value);
 

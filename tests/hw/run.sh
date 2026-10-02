@@ -39,15 +39,17 @@ for t in $tests; do
     for gfx in $backends; do
         log="$out/$t.$gfx.log"
         : > "$log"
+        # In a process group of its own (setsid), so the emulator, xvfb-run and
+        # Xvfb end together with one kill of the group, and nothing else whose
+        # command line happens to mention the binary is touched.
         (cd "$out" && SDL_AUDIODRIVER=dummy ZS1_LOG_STDERR=1 ZS1_GFX=$gfx \
-            exec xvfb-run -a -s "-screen 0 1280x720x24" "$emu" zero_bios.bin --exe="$t.exe") > "$log" 2>&1 &
+            exec setsid xvfb-run -a -s "-screen 0 1280x720x24" "$emu" zero_bios.bin --exe="$t.exe") > "$log" 2>&1 &
         pid=$!
         waited=0
         while [ $waited -lt "$timeout_s" ] && ! grep -q "HWTEST $t DONE" "$log"; do
             sleep 1; waited=$((waited + 1))
         done
-        pkill -P $pid 2>/dev/null; kill $pid 2>/dev/null; wait $pid 2>/dev/null
-        pkill -f "$emu zero_bios.bin --exe=$t.exe" 2>/dev/null
+        kill -TERM "-$pid" 2>/dev/null; wait $pid 2>/dev/null   # dash: no "--" here
         backend=$(grep -o "Backend selected: [A-Za-z0-9 .]*" "$log" | tail -1)
         echo "== $t on $gfx (${backend:-backend unknown})"
         grep -o "HWTEST .*" "$log" | sed 's/\x1b\[[0-9;]*m//g' | grep -v " BEGIN$"

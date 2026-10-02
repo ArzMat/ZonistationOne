@@ -780,6 +780,9 @@ int main(int argc, char* argv[]) {
                                       (double)cycles_per_frame / (double)PSX_SYSCLK_HZ);
     uint64_t next_frame = SDL_GetPerformanceCounter() + frame_ticks;
 
+    /* ZS1_FRAME_PROFILE=1: per-field wall-clock buckets, see the [PROF] line. */
+    const int s_prof = getenv("ZS1_FRAME_PROFILE") ? 1 : 0;
+
     while (!quit) {
         while (SDL_PollEvent(&ev)) {
             controller_process_event(&gamepad, &ev);
@@ -927,24 +930,34 @@ int main(int argc, char* argv[]) {
         controller_update_rumble(&gamepad, rumble_m1, rumble_m2);
         inject_tty_keys(&inter);
 
-        /* Wait for GPU to finish the previous frame's rendering. */
-        renderer_wait_frame_done(&inter.gpu.renderer);
-
         /* Host-side frame pacing budget follows the GPU's video mode. */
         cycles_per_frame = gpu_cycles_per_frame(&inter.gpu);
         frame_ticks = (uint64_t)((double)SDL_GetPerformanceFrequency() *
                                  (double)cycles_per_frame / (double)PSX_SYSCLK_HZ);
 
-        /* ZS1_FRAME_PROFILE=1: where the frame's wall-clock time actually goes.
-         * The emulator has to deliver 44100 audio samples per real second, so
-         * any millisecond spent outside emulation is a millisecond of audio the
-         * device will not get. */
-        static int s_prof = -1;
-        if (s_prof < 0) s_prof = getenv("ZS1_FRAME_PROFILE") ? 1 : 0;
-        uint64_t t_freq = SDL_GetPerformanceFrequency(), t0 = 0, t1 = 0, t2 = 0, t3 = 0, t4 = 0;
+        uint64_t t0 = 0, t1 = 0, t_w0 = 0, t_w1 = 0, t_ui = 0, t2 = 0, t3 = 0, t4 = 0, t_p0 = 0;
         if (s_prof) t0 = SDL_GetPerformanceCounter();
 
-        /* Run the machine for one video frame (or one debugger step). */
+        /* Run the machine for one video frame (or one debugger step).
+         *
+         * This used to come after renderer_wait_frame_done(), so every field
+         * began by waiting for the GPU thread to finish the previous one,
+         * buffer swap included; when the swap blocks on vblank (a 60 Hz panel
+         * under 50 Hz content, a FIFO swapchain) that wait was added to the
+         * field instead of overlapping it. Emulation does not need the GPU
+         * thread to be idle:
+         *   - it only records into the renderer's write slot; the GPU thread
+         *     replays the other slot, and the slots trade places only in
+         *     renderer_submit_frame(), under the mutex, after frames_pending
+         *     has gone back to zero;
+         *   - a synchronous VRAM readback (GP0(80h)/GP0(C0h)) waits for the
+         *     previous frame by itself before replaying the write slot, on
+         *     both backends;
+         *   - savestate loads and backend switches run at the top of the loop
+         *     and wait on their own (load_state_guarded, switch_gfx_backend).
+         * What the wait protects is ImGui: the GPU thread is drawing the
+         * previous frame's draw data, and ImGui::NewFrame() reuses it. So the
+         * wait now sits after emulation and before debug_ui_render(). */
         system_run_frame(&inter, &cpu);
         if (s_prof) t1 = SDL_GetPerformanceCounter();
 
@@ -971,59 +984,36 @@ int main(int argc, char* argv[]) {
             vit_prev_samples = cur_samples;
         }
 
+        /* The GPU thread must be done with the previous frame's ImGui draw data
+         * (and the ImGui textures it updates) before NewFrame() touches them. */
+        if (s_prof) t_w0 = SDL_GetPerformanceCounter();
+        renderer_wait_frame_done(&inter.gpu.renderer);
+        if (s_prof) t_w1 = SDL_GetPerformanceCounter();
+
         /* Build ImGui for this frame (SDL + widget code, no GL) */
         debug_ui_render(&cpu, &inter);
+        if (s_prof) t_ui = SDL_GetPerformanceCounter();
 
-        /* Full VRAM upload at end of frame — ensures vram_texture matches vram.data even when
-         * GP0(A0) sprite loads cleared vram_dirty (preventing upload_vram_if_dirty in draw cmds).
-         * Processed BEFORE draw batches in GPU thread so all sprite/CLUT data is current. */
+        /* Whole-VRAM sync for the GL backend's R16UI sampling mirror. Only a
+         * driver without a texture barrier samples that mirror; everywhere else
+         * the backend returns without copying anything (renderer_gl.c), and
+         * Vulkan has no mirror at all. */
         renderer_upload_vram(&inter.gpu.renderer, (const uint16_t*)inter.gpu.vram.data);
         if (s_prof) t2 = SDL_GetPerformanceCounter();
 
         /* The VRAM viewer is filled by a shader pass on the GPU thread now, from
          * the same texture the rasteriser draws into. It used to be converted
-         * here from gpu.vram.data and uploaded — 2 MB of staging per frame for an
+         * here from gpu.vram.data and uploaded: 2 MB of staging per frame for an
          * image that could not show anything the game drew, because that buffer
          * only ever receives uploads, fills and DMA. */
         if (s_prof) t3 = SDL_GetPerformanceCounter();
 
         /* Submit frame to GPU thread: swap buffers, wake renderer */
         renderer_submit_frame(&inter.gpu.renderer, debug_ui_get_draw_data());
+        if (s_prof) t4 = SDL_GetPerformanceCounter();
         debug_ui_flush_logs();
-        if (s_prof) {
-            t4 = SDL_GetPerformanceCounter();
-            extern uint64_t g_spu_gen_ticks;
-            static int frames = 0; static double a_emu, a_up, a_view, a_sub, a_spu;
-            a_spu += (double)g_spu_gen_ticks * 1000.0 / (double)t_freq; g_spu_gen_ticks = 0;
-            a_emu  += (double)(t1 - t0) * 1000.0 / (double)t_freq;
-            a_up   += (double)(t2 - t1) * 1000.0 / (double)t_freq;
-            a_view += (double)(t3 - t2) * 1000.0 / (double)t_freq;
-            a_sub  += (double)(t4 - t3) * 1000.0 / (double)t_freq;
-            if (++frames == 60) {
-                /* Cycles per instruction, over the same 60 frames. This is the
-                 * independent check on the RAM data-access cost in bus.c: that
-                 * constant was calibrated so the BIOS VSync loop spans a field,
-                 * and a single loop can be made to say anything. CPI is a second,
-                 * unrelated observation over all executed code — real R3000A code
-                 * is mostly single-cycle ALU work punctuated by memory access, so
-                 * a believable figure sits a little above 1. A CPI near 1 means
-                 * the model is not being charged; a CPI far above it means the
-                 * constant is buying the VSync fix by slowing everything down. */
-                static uint32_t prev_cyc;
-                static uint64_t prev_ins;
-                uint32_t cyc = inter.cpu_cycle_counter;   /* 32-bit and wraps */
-                uint64_t ins = inter.instructions_retired;
-                uint32_t dcyc = cyc - prev_cyc;           /* unsigned: wrap-safe */
-                uint64_t dins = ins - prev_ins;
-                double cpi = dins ? (double)dcyc / (double)dins : 0.0;
-                prev_cyc = cyc; prev_ins = ins;
-                LOG_SYSTEM_INFO("[PROF] per frame: emu=%.2fms (spu %.2fms) vram_upload=%.2fms viewer=%.2fms submit=%.2fms total=%.2fms | CPI=%.3f",
-                                a_emu / 60, a_spu / 60, a_up / 60, a_view / 60, a_sub / 60,
-                                (a_emu + a_up + a_view + a_sub) / 60, cpi);
-                frames = 0; a_emu = a_up = a_view = a_sub = a_spu = 0;
-            }
-        }
 
+        if (s_prof) t_p0 = SDL_GetPerformanceCounter();
         /* Pacing.
          *
          * With an audio device open the sound queue is the clock: the emulator
@@ -1048,6 +1038,82 @@ int main(int argc, char* argv[]) {
                 next_frame += frame_ticks;
             } else {
                 next_frame = now + frame_ticks;
+            }
+        }
+
+        /* ZS1_FRAME_PROFILE=1: where the frame's wall-clock time actually goes.
+         * The emulator has to deliver 44100 audio samples per real second, so
+         * any millisecond spent outside emulation is a millisecond of audio the
+         * device will not get.
+         *
+         * The first fields keep their names and meanings so old logs still
+         * compare: emu, spu, vram_upload (debug UI + VRAM upload), viewer,
+         * submit, total (their sum) and CPI. Appended after them:
+         *   wait    renderer_wait_frame_done(): the GPU thread finishing the
+         *           previous frame, buffer swap included;
+         *   ui      debug_ui_render() on its own;
+         *   upload  renderer_upload_vram() on its own;
+         *   pace    the audio-ring / refresh pacing at the end of the field;
+         *   frame   the whole loop iteration, wall clock;
+         * and the worst field of the window for each, as *_max: a stall that
+         * hits one field in sixty disappears in a mean. */
+        if (s_prof) {
+            const uint64_t t5 = SDL_GetPerformanceCounter();
+            const double   ms = 1000.0 / (double)SDL_GetPerformanceFrequency();
+            extern uint64_t g_spu_gen_ticks;
+            static uint64_t prev_t5 = 0;
+            static int frames = 0;
+            static double a_emu, a_up, a_view, a_sub, a_spu, a_wait, a_ui, a_upl, a_pace, a_frame;
+            static double m_emu, m_wait, m_ui, m_upl, m_sub, m_pace, m_frame;
+            const double d_emu   = (double)(t1 - t0) * ms;
+            const double d_wait  = (double)(t_w1 - t_w0) * ms;
+            const double d_ui    = (double)(t_ui - t_w1) * ms;
+            const double d_upl   = (double)(t2 - t_ui) * ms;
+            const double d_view  = (double)(t3 - t2) * ms;
+            const double d_sub   = (double)(t4 - t3) * ms;
+            const double d_pace  = (double)(t5 - t_p0) * ms;
+            const double d_frame = prev_t5 ? (double)(t5 - prev_t5) * ms : 0.0;
+            prev_t5 = t5;
+            a_spu += (double)g_spu_gen_ticks * ms; g_spu_gen_ticks = 0;
+            a_emu += d_emu;  a_up += d_ui + d_upl;  a_view += d_view;  a_sub += d_sub;
+            a_wait += d_wait; a_ui += d_ui; a_upl += d_upl; a_pace += d_pace; a_frame += d_frame;
+            if (d_emu   > m_emu)   m_emu   = d_emu;
+            if (d_wait  > m_wait)  m_wait  = d_wait;
+            if (d_ui    > m_ui)    m_ui    = d_ui;
+            if (d_upl   > m_upl)   m_upl   = d_upl;
+            if (d_sub   > m_sub)   m_sub   = d_sub;
+            if (d_pace  > m_pace)  m_pace  = d_pace;
+            if (d_frame > m_frame) m_frame = d_frame;
+            if (++frames == 60) {
+                /* Cycles per instruction, over the same 60 frames. This is the
+                 * independent check on the RAM data-access cost in bus.c: that
+                 * constant was calibrated so the BIOS VSync loop spans a field,
+                 * and a single loop can be made to say anything. CPI is a second,
+                 * unrelated observation over all executed code: real R3000A code
+                 * is mostly single-cycle ALU work punctuated by memory access, so
+                 * a believable figure sits a little above 1. A CPI near 1 means
+                 * the model is not being charged; a CPI far above it means the
+                 * constant is buying the VSync fix by slowing everything down. */
+                static uint32_t prev_cyc;
+                static uint64_t prev_ins;
+                uint32_t cyc = inter.cpu_cycle_counter;   /* 32-bit and wraps */
+                uint64_t ins = inter.instructions_retired;
+                uint32_t dcyc = cyc - prev_cyc;           /* unsigned: wrap-safe */
+                uint64_t dins = ins - prev_ins;
+                double cpi = dins ? (double)dcyc / (double)dins : 0.0;
+                prev_cyc = cyc; prev_ins = ins;
+                LOG_SYSTEM_INFO("[PROF] per frame: emu=%.2fms (spu %.2fms) vram_upload=%.2fms viewer=%.2fms submit=%.2fms total=%.2fms | CPI=%.3f"
+                                " | wait=%.2fms ui=%.2fms upload=%.2fms pace=%.2fms frame=%.2fms"
+                                " | emu_max=%.2fms wait_max=%.2fms ui_max=%.2fms upload_max=%.2fms"
+                                " submit_max=%.2fms pace_max=%.2fms frame_max=%.2fms",
+                                a_emu / 60, a_spu / 60, a_up / 60, a_view / 60, a_sub / 60,
+                                (a_emu + a_up + a_view + a_sub) / 60, cpi,
+                                a_wait / 60, a_ui / 60, a_upl / 60, a_pace / 60, a_frame / 60,
+                                m_emu, m_wait, m_ui, m_upl, m_sub, m_pace, m_frame);
+                frames = 0;
+                a_emu = a_up = a_view = a_sub = a_spu = 0;
+                a_wait = a_ui = a_upl = a_pace = a_frame = 0;
+                m_emu = m_wait = m_ui = m_upl = m_sub = m_pace = m_frame = 0;
             }
         }
     }

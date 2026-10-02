@@ -83,10 +83,16 @@ static uint8_t   s_vram_pool[2][VKR_VRAM_POOL_SIZE];
 static uint32_t  s_vram_pool_used[2];
 static uint32_t  s_pool_peak, s_pool_updates, s_pool_skips;
 
-/* Whole-VRAM readback, matching the GL backend's async channel. */
-static uint16_t     s_readback_vram[VKR_VRAM_W * VKR_VRAM_H];
+/* Whole-VRAM readback, matching the GL backend's async channel: two buffers
+ * published by index, for the same reason as there. The render thread fills
+ * the one readers are not holding, then flips s_readback_pub and bumps the
+ * sequence; a Lua probe reading the result from inside the emulation, which
+ * now overlaps the render thread's previous frame, never sees a half-written
+ * buffer. The sequence is atomic for the same reason. */
+static uint16_t      s_readback_vram[2][VKR_VRAM_W * VKR_VRAM_H];
+static SDL_AtomicInt s_readback_pub;
 static SDL_AtomicInt s_readback_request;
-static uint32_t     s_readback_seq;
+static SDL_AtomicInt s_readback_seq;
 
 /* ------------------------------------------------------------------------- */
 /* Small resource helpers                                                     */
@@ -859,9 +865,10 @@ void vkr_update_vram_viewer(VkRenderer* r, const uint8_t* bytes) { (void)r; (voi
 
 void vkr_get_pool_stats(VkRenderer* r, uint32_t* used, uint32_t* peak,
                         uint32_t* updates, uint32_t* skips) {
-    (void)r;
-    if (used)    *used    = s_vram_pool_used[0] > s_vram_pool_used[1]
-                            ? s_vram_pool_used[0] : s_vram_pool_used[1];
+    /* The write slot only, as the GL backend reports it. The other slot belongs
+     * to the render thread, which may be resetting it right now: emulation (and
+     * the Lua probe that asks for this) overlaps the previous frame's replay. */
+    if (used)    *used    = s_vram_pool_used[r->write_idx];
     if (peak)    *peak    = s_pool_peak;
     if (updates) *updates = s_pool_updates;
     if (skips)   *skips   = s_pool_skips;
@@ -967,8 +974,8 @@ void vkr_request_vram_readback(VkRenderer* r) {
 }
 
 const uint16_t* vkr_get_vram_readback(uint32_t* seq_out) {
-    if (seq_out) *seq_out = s_readback_seq;
-    return s_readback_vram;
+    if (seq_out) *seq_out = (uint32_t)SDL_GetAtomicInt(&s_readback_seq);
+    return s_readback_vram[SDL_GetAtomicInt(&s_readback_pub)];
 }
 
 /* ------------------------------------------------------------------------- */
@@ -1495,8 +1502,11 @@ static int vkr_thread_main(void* userdata) {
         /* The async whole-VRAM readback the inspector's CPU-vs-GPU diff uses. */
         if (SDL_GetAtomicInt(&s_readback_request)) {
             vkQueueWaitIdle(r->ctx.queue);
-            if (vkr_do_readback(r, 0, 0, VKR_VRAM_W, VKR_VRAM_H, s_readback_vram))
-                s_readback_seq++;
+            const int back = 1 - SDL_GetAtomicInt(&s_readback_pub);
+            if (vkr_do_readback(r, 0, 0, VKR_VRAM_W, VKR_VRAM_H, s_readback_vram[back])) {
+                SDL_SetAtomicInt(&s_readback_pub, back);
+                SDL_AddAtomicInt(&s_readback_seq, 1);
+            }
             SDL_SetAtomicInt(&s_readback_request, 0);
         }
 
@@ -1584,6 +1594,14 @@ bool vkr_read_vram_rect(VkRenderer* r, uint16_t* out,
     VKR_FLUSH(r);
 
     SDL_LockMutex(r->gpu_mutex);
+    /* The previous frame first. The render thread looks at a parked readback
+     * before it looks at a pending frame, so a request that arrives while a
+     * frame is still pending would be served from a VRAM image that does not
+     * yet hold that frame. Before main.c started emulating while the previous
+     * frame renders this could not happen (the frame was always done by the
+     * time the machine ran); now it can, and the GL backend has always waited
+     * here for the same reason. */
+    while (r->frames_pending > 0) SDL_WaitCondition(r->frame_done, r->gpu_mutex);
     s_sync_rb_dest = out;
     s_sync_rb_x = x; s_sync_rb_y = y; s_sync_rb_w = w; s_sync_rb_h = h;
     s_sync_rb_ok = false;

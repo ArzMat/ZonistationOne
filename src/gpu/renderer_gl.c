@@ -130,7 +130,17 @@ static bool s_texture_barrier = false;
 
 static SDL_AtomicInt s_readback_request;   /* CPU sets 1; GPU clears when done */
 static SDL_AtomicInt s_readback_seq;       /* incremented after each completed readback */
-static uint16_t     s_readback_vram[1024 * 512];   /* packed 1555, mask bit in 15 */
+/* Two buffers, published by index. The GPU thread fills the one readers are
+ * not holding and then flips s_readback_pub. One buffer was enough while the
+ * emulation thread only ran with the GPU thread idle; since main.c emulates the
+ * next field while the GPU thread finishes the previous one, a Lua probe that
+ * reads the result from inside the emulation (emu.vram_map, emu.vram_compare)
+ * could otherwise be reading the buffer while the GPU thread rewrites it. The
+ * GPU thread services at most one request per frame, and the emulation thread
+ * never runs more than one frame ahead, so a reader's buffer is never the one
+ * being written. */
+static uint16_t     s_readback_vram[2][1024 * 512];   /* packed 1555, mask bit in 15 */
+static SDL_AtomicInt s_readback_pub;       /* index of the buffer readers get */
 static uint8_t      s_readback_rgba[1024 * 512 * 4];
 
 /* GPU thread. Unpacks vram_tex (RGBA8, 5:5:5:1 expanded as (v<<3)|(v>>2),
@@ -142,14 +152,17 @@ static void glr_service_vram_readback(GlRenderer* renderer) {
     glGetTexImage(GL_TEXTURE_2D, 0, GL_RGBA, GL_UNSIGNED_BYTE, s_readback_rgba);
     glBindTexture(GL_TEXTURE_2D, 0);
 
+    const int back = 1 - SDL_GetAtomicInt(&s_readback_pub);
+    uint16_t* out = s_readback_vram[back];
     for (uint32_t i = 0; i < 1024u * 512u; i++) {
         const uint8_t* p = &s_readback_rgba[i * 4];
-        s_readback_vram[i] = (uint16_t)(((uint16_t)(p[0] >> 3))
+        out[i] = (uint16_t)(((uint16_t)(p[0] >> 3))
                                       | ((uint16_t)(p[1] >> 3) << 5)
                                       | ((uint16_t)(p[2] >> 3) << 10)
                                       | (p[3] >= 128 ? 0x8000u : 0u));
     }
 
+    SDL_SetAtomicInt(&s_readback_pub, back);
     SDL_SetAtomicInt(&s_readback_request, 0);
     SDL_AddAtomicInt(&s_readback_seq, 1);
 }
@@ -161,7 +174,7 @@ void glr_request_vram_readback(GlRenderer* renderer) {
 
 const uint16_t* glr_get_vram_readback(uint32_t* seq_out) {
     if (seq_out) *seq_out = (uint32_t)SDL_GetAtomicInt(&s_readback_seq);
-    return s_readback_vram;
+    return s_readback_vram[SDL_GetAtomicInt(&s_readback_pub)];
 }
 
 /* --- Synchronous mid-frame readback (GP0(0xC0), GP0(0x80)) ----------------
@@ -2026,6 +2039,38 @@ static void glr_execute_one_vram_update(GlRenderer* renderer, const GpuVramUpdat
     }
 }
 
+/* ZS1_VSYNC=0|1|-1: the GL swap interval, set on the thread that owns the
+ * context (it is per-context state, and this is where the context is current).
+ *
+ * Unset, nothing is called and the driver's default stands, which is exactly
+ * what every run did before this existed: the tree never called
+ * SDL_GL_SetSwapInterval at all. Set, it makes the vsync A/B repeatable
+ * instead of depending on __GL_SYNC_TO_VBLANK / vblank_mode, which differ per
+ * driver. 0 is off (the audio ring is the clock anyway, main.c pacing), 1 is
+ * vsync, -1 is adaptive vsync (late frames tear instead of waiting a whole
+ * refresh), falling back to 1 where the driver has no adaptive mode. */
+static void glr_apply_vsync_preference(void) {
+    const char* v = getenv("ZS1_VSYNC");
+    if (!v) return;
+    int want = atoi(v);
+    if (want < -1 || want > 1) {
+        LOG_RENDERER_WARN("[GPU-THREAD] ZS1_VSYNC=\"%s\" not recognised (want 0, 1 or -1); "
+                          "leaving the driver default", v);
+        return;
+    }
+    bool ok = SDL_GL_SetSwapInterval(want);
+    if (!ok && want == -1) {
+        LOG_RENDERER_WARN("[GPU-THREAD] Adaptive vsync refused (%s); using 1", SDL_GetError());
+        want = 1;
+        ok = SDL_GL_SetSwapInterval(want);
+    }
+    int got = 0;
+    SDL_GL_GetSwapInterval(&got);
+    if (ok) LOG_RENDERER_INFO("[GPU-THREAD] ZS1_VSYNC: swap interval %d (driver reports %d)", want, got);
+    else    LOG_RENDERER_WARN("[GPU-THREAD] ZS1_VSYNC: SDL_GL_SetSwapInterval(%d) failed: %s",
+                              want, SDL_GetError());
+}
+
 /* GPU thread argument */
 typedef struct {
     GlRenderer*     renderer;
@@ -2097,6 +2142,7 @@ static int gpu_thread_main(void* userdata) {
         return -1;
     }
     LOG_RENDERER_INFO("[GPU-THREAD] GPU thread started — GL context acquired");
+    glr_apply_vsync_preference();
 
     /* ImGui OpenGL backend needs to be initialized on this thread */
     extern void imgui_opengl_new_frame(void);

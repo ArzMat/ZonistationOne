@@ -227,6 +227,33 @@ static void test_lsax_write_then_loop_start(void) {
     CHECK(a[2] == 0x6010, "Loop End jumps to the Loop Start block: %05x", a[2]);
 }
 
+/* An LSAX write once the voice is past its first block wins over the
+ * sample's Loop Start flags until the next Key On: the redirect of a playing
+ * sample (spu.c, LSAX write). Key On clears it. */
+static void test_lsax_write_mid_playback_latches(void) {
+    reset_all();
+    wr(SPU_REG(0x1AA), 0x8000);
+    put_block(0x6000, 0x00, 0x11);
+    put_block(0x6010, 0x04, 0x11);       /* Loop Start */
+    put_block(0x6020, 0x03, 0x11);
+    put_block(0x7000, 0x07, 0x00);       /* silent loop elsewhere */
+    voice_cfg(5, 0x6000);
+    key_on(5);
+    uint32_t a[5];
+    run_fetches(5, 2, a);                /* 0x6000, 0x6010: past the first block */
+    wr(VREG(5, 0xE), 0x7000 >> 3);
+    run_fetches(5, 3, a);                /* 0x6020 (Loop End), then the redirect */
+    CHECK(spu()->voices[5].repeat_address == 0x7000 >> 3,
+          "write past the first block survives the next Loop Start: %04x",
+          spu()->voices[5].repeat_address);
+    CHECK(a[1] == 0x7000, "Loop End jumps to the written address: %05x", a[1]);
+    key_on(5);
+    run_fetches(5, 3, a);                /* Key On clears the latch */
+    CHECK(spu()->voices[5].repeat_address == 0x6010 >> 3,
+          "after Key On the sample's Loop Start sets LSAX again: %04x",
+          spu()->voices[5].repeat_address);
+}
+
 /* ---- IRQ (A2: I1, I2, I4, I5) --------------------------------------------- */
 
 static void ack_irq9(void) {
@@ -549,6 +576,7 @@ int main(void) {
     test_kon_keeps_preset_lsax();
     test_code1_end_mute();
     test_lsax_write_then_loop_start();
+    test_lsax_write_mid_playback_latches();
     test_irq_at_loop_start_every_pass();
     test_irq_not_early_and_mid_block();
     test_no_irq_on_register_write();

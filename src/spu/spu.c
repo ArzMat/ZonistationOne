@@ -92,6 +92,8 @@ void spu_process_key_on_off(Spu* spu) {
             memset(voice->gauss_ring, 0, sizeof(voice->gauss_ring));
             voice->gpos         = 0;
             voice->reach_end    = false;
+            voice->ignore_loop  = false;        /* see the LSAX write */
+            voice->blocks_since_kon = 0;
             voice->curr_addr    = (uint32_t)voice->start_address * 8;
             voice->start_addr   = voice->curr_addr;
             voice->on           = true;
@@ -321,13 +323,24 @@ static void voice_write_reg(Spu* spu, int voice, int sub, uint16_t value) {
             v->adsr_volume = (int16_t)value;
             break;
         case 0x0E:
-            /* A write just sets the repeat address (soundprocessingunitspu.md:
-             * 142-147). It used to also latch "ignore Loop Start flags" until the
-             * next Key On, so a stream that wrote LSAX once and then kept
-             * rewriting blocks with Loop Start flags looped back to the stale
-             * address: the same chunk again. Nothing in the documentation
-             * describes such a latch. */
+            /* A write sets the repeat address (soundprocessingunitspu.md:
+             * 142-147), "eg. to redirect a one-shot sample ... to a silent-loop
+             * located elsewhere in memory". The documentation does not say
+             * whether a Loop Start flag read afterwards overrides the write.
+             * The reference emulator, with games named in its comments, lets the
+             * write win (Loop Start flags are ignored until the next Key On)
+             * when the voice is off or already past its first block, and lets
+             * the sample's own Loop Start win when the write lands during the
+             * first block, the moment a driver sets LSAX right after Key On.
+             * That is followed here. Key On clears the latch, so a write made
+             * before Key On never suppresses the sample's flags. Before this
+             * rule existed every write latched (a redirect worked, a write right
+             * after Key On broke the sample's own loop), and for a while no
+             * write did (the redirect stopped working); docs/study/
+             * SPU_2026-07-29.md finding 11 has the history. */
             v->repeat_address = value;
+            if (!v->on || v->blocks_since_kon >= 2)
+                v->ignore_loop = true;
             break;
     }
 }

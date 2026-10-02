@@ -184,6 +184,7 @@ static void store_interp(SpuVoice* voice, int fa) {
  * ========================================================================= */
 
 static void voice_fetch_block(Spu* spu, struct Interconnect* inter, SpuVoice* voice, bool decode) {
+    if (voice->blocks_since_kon < 2) voice->blocks_since_kon++;
     /* Code 1 on the block just played: its Release and zero envelope are due
      * now that the block is done, on the same "after playing the current ADPCM
      * block" boundary as the jump itself (:136-138). A silent voice has no
@@ -247,8 +248,9 @@ static void voice_fetch_block(Spu* spu, struct Interconnect* inter, SpuVoice* vo
         voice->s_2 = s_2;
     }
 
-    /* Loop Start: the repeat address becomes this block (:134-135). */
-    if (flags & 4)
+    /* Loop Start: the repeat address becomes this block (:134-135), unless a
+     * software write has latched it (the LSAX write in spu.c). */
+    if ((flags & 4) && !voice->ignore_loop)
         voice->repeat_address = (uint16_t)(a >> 3);
 
     /* Loop End: the next block is the one at the repeat address, read once this

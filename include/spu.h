@@ -206,13 +206,14 @@ typedef struct SpuVoice {
     /* ADPCM decode state */
     uint32_t curr_addr;             /* byte address of the next block to read */
     uint32_t start_addr;            /* start byte address (copy taken at Key On) */
-    /* loop_addr, loop_addr_set and ignore_loop are no longer read. The loop
-     * point is repeat_address itself, as the hardware keeps it
-     * (soundprocessingunitspu.md:133-138). The three stay so sizeof(Spu) does
-     * not move for them; the savestate stores the SPU as one sized span. */
-    uint32_t loop_addr;             /* unused */
+    /* The loop point is repeat_address itself, as the hardware keeps it
+     * (soundprocessingunitspu.md:133-138). blocks_since_kon (saturating at 2)
+     * and ignore_loop implement the one latch the documentation does not
+     * describe: see the LSAX write in spu.c. loop_addr_set is no longer read
+     * and stays so the layout of the other fields does not move. */
+    uint32_t blocks_since_kon;      /* blocks fetched since Key On, stops at 2 */
     bool     loop_addr_set;         /* unused */
-    bool     ignore_loop;           /* unused */
+    bool     ignore_loop;           /* Loop Start flags ignored until Key On */
     /* A Code 1 block (End+Mute) was just read: Release and envelope 0 are owed
      * once that block has been played (see voice_fetch_block). */
     bool     reach_end;

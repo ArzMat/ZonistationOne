@@ -1227,3 +1227,66 @@ stessa run.
   le pseudo-soluzioni sono scritte dalla doc citata.
 - Il sito di nocash (`problemkaputt.de`) e `psx-spx.consoledev.net` non erano raggiungibili da questo
   ambiente; il testo usato è il repository GitHub di psx-spx al commit indicato in testa.
+
+---
+
+## 8. Stato dopo le correzioni (2026-10-02, sera)
+
+Le correzioni sono sul branch `claude/wizardly-planck-fb7ppi`; il dettaglio è nel blocco del
+2026-10-02 in `CHANGELOG.md`. Nessuna è stata provata con un BIOS o un disco. Le verifiche fatte qui:
+
+- `make test`: otto programmi di test unitari (CPU, log, MDEC, VRAM, DMA, SPU, CD-ROM), tutti verdi;
+- `make hwtest`: quindici controlli in programmi PS-X EXE scritti apposta (`tests/hw/`), eseguiti
+  dentro l'emulatore su un BIOS di zeri, sia su OpenGL sia su Vulkan (llvmpipe e lavapipe sotto
+  Xvfb). Sul codice di partenza fallivano 12 controlli su 15, almeno su un backend (gli altri 3 sono controlli di contorno); ora passano tutti
+  su entrambi;
+- un salvataggio e un caricamento sopra il test GPU: ciclo e PC tornano identici, e un pixel scritto
+  solo dal rasterizzatore sopravvive al caricamento;
+- la parte cluster provata dal vivo con GStreamer 1.24.2, PulseAudio 16.1 e ffmpeg 6.1.1.
+
+| Voce | Esito |
+|---|---|
+| P1-P10, F12 (lettura MODE), F15, F17, F19, N2, N3, N5 | fatte |
+| V1-V4, R6, R7, R9-R11, R14, F10, F14, P4, N4, GP1(10h) | fatte; V4 col wrap letterale solo con `ZS1_MDEC_WRAP9=1` |
+| R12 | parziale: DREQ1 non modellato, la doc è troppo vaga |
+| 5.1 (modello di costo DMA) | fatto, ma solo con `ZS1_DMA_STALL=doc`: cambia il tempo emulato |
+| A1-A11, R8 (Read dopo Pause), capture CD | fatte; A5 nella versione minima, `ZS1_CD_XA_HOLD=1` per tornare indietro |
+| C1-C5, C8a, C8c, C8f | fatte |
+| C6 (SDL 3.4.0) | non applicata, vedi sotto |
+| C7 (latenza audio nel pod) | aggiunto `ZS1_SPU_RING_TARGET`; il valore va scelto dopo l'A/B con `ZS1_SPU_NO_STRETCH=1` |
+| F13 (read-ahead del CD) | non fatta: tocca il thread di lettura e il determinismo, va progettata a parte |
+
+### Dove l'implementazione ha corretto questo documento
+
+- **C6 era sbagliata nell'effetto.** Misurato qui: con SDL 3.2.24 l'emulatore riceve `buf=1024`
+  invece di 512 (il bug c'è). Con SDL 3.4.0 riceve però `buf=384`, e la latenza del buffer
+  PulseAudio sale da 6,6 a 9,6 ms. In più, per compilare la 3.4.0 servono `libxcursor-dev`,
+  `libxi-dev` e altre librerie X11 di sviluppo. Il guadagno di 12 ms non è dimostrato, e il
+  Dockerfile resta alla 3.2.24 con la misura scritta accanto.
+- **Il readback Vulkan scriveva nel posto sbagliato.** Oltre a N3, copiava il rettangolo
+  impacchettato all'inizio della VRAM invece che al suo posto, e il buffer sopravviveva al cambio di
+  backend. Nessuna delle due cose era nel documento; ora sono corrette.
+- **L'upload GP0(A0h) non avvolgeva nemmeno lato CPU** (R11 lo dava per corretto): scartava i
+  pixel oltre la colonna 1023 o la riga 511.
+- **F16:** gli zeri del FIR sono 18, non 19.
+- **P1:** l'argomento sulla sicurezza dei thread valeva solo per GL. Su Vulkan il readback non
+  aspettava il frame in volo, e il buffer di readback asincrono poteva essere letto a metà
+  riscrittura. Corretti entrambi.
+- **Trovati di passaggio e corretti:** su Vulkan l'offset della finestra texture non veniva
+  mascherato; su GL un'area di disegno vuota disegnava una colonna di un pixel; una scrittura di DPCR
+  faceva ripartire un trasferimento GPU già in corso, che inviava i dati due volte.
+
+### Da verificare con BIOS e disco
+
+1. **Volume CD a 0 = silenzio.** È quello che dice la doc, ma se un gioco si affidava al vecchio
+   "0 = volume pieno", ora il suo XA o CD-DA tace; una riga INFO nel log lo segnala. Da provare: il
+   lettore CD del BIOS, gli FMV di Ace Combat 2, Dino Crisis.
+2. **Loop della SPU senza il latch su LSAX.** La doc non lo descrive, ma `docs/study/SPU_2026-07-29.md`
+   ricorda che un altro emulatore lo tiene: è il primo sospetto se un gioco perde un loop.
+3. **Le cinematiche 3D di Dino Crisis:** prima `scripts/cutscene_audio_classify.lua` da un
+   savestate appena prima della scena, poi l'ascolto.
+4. **P1 e vsync:** `ZS1_FRAME_PROFILE=1` (ora con `wait=`) su entrambe le GPU, con e senza
+   `ZS1_VSYNC=0`.
+5. **`ZS1_DMA_STALL=doc`:** pietre miliari di boot in campi emulati contro la run di riferimento,
+   prima di renderlo predefinito.
+6. **Savestate:** quelli della versione 11 vengono rifiutati (ora la versione è 12) e vanno rifatti.

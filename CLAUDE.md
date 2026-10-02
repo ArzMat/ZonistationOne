@@ -10,7 +10,8 @@ swapped while a game runs. Early development.
 ```bash
 make                    # build
 make clean && make      # clean build
-make test               # run cpu_minimal_test
+make test               # unit tests: tests/*_test.c, no SDL, BIOS or disc needed
+make hwtest             # bare-metal PS-X EXEs inside the emulator, GL and Vulkan (tests/hw/)
 ./ZoniStation_One roms/bios-ntsc.bin                          # BIOS menu
 ./ZoniStation_One roms/bios-pal.bin --game="games/game.bin"   # a disc
 ```
@@ -30,6 +31,15 @@ gameplay), `ZS1_UI_SCALE=<f>` (overrides the display-derived interface scale),
 `ZS1_GFX=gl|vulkan` (which renderer starts; also changeable at runtime from Esc -> Video),
 `ZS1_VK_VALIDATE=1` (Vulkan validation layer), `ZS1_GFX_SWITCH_TEST=<n>` (flip the renderer every
 n fields — the leak check for the switch path).
+
+Added 2026-10-02 (CHANGELOG, block of that date): `ZS1_VSYNC=0|1|-1` (GL swap interval or Vulkan
+present mode; unset leaves the driver's), `ZS1_FORCE_READBACK=1` (GP0(80h)/(C0h) read back every
+time instead of only where the rasteriser may have drawn), `ZS1_MDEC_WRAP9=1` (the literal 9-bit wrap
+of yuv_to_rgb), `ZS1_DMA_STALL=doc` (opt-in documented DMA cost; changes emulated timing),
+`ZS1_CD_XA_HOLD=1` (the old "drive stops for any pending INT"), `ZS1_SPU_RING_TARGET=<frames>`. Lua:
+`emu.on_event(fn, "vblank", ...)` filters in C, plus `emu.spu_voice(n)`, `emu.spu_irq()`,
+`emu.cd_state()`. Build: `make LOG_MAX_LEVEL=TRACE` (TRACE is compiled out otherwise),
+`make PGO_GEN=1` / `make PGO_USE=1`.
 
 `ZS1_GPU=nvidia|intel` picks the GPU on this hybrid machine — it sets the PRIME offload variables
 before the context is created, and the run logs which driver it got and whether the request was
@@ -153,7 +163,8 @@ src/utils/
   rxi_log.c                    — rxi log backend
 
 src/debug_ui.cpp               — ImGui debug UI (C++)
-tests/cpu_minimal_test.c       — minimal CPU integration test
+tests/*_test.c                 - unit tests, each includes the source under test (make test)
+tests/hw/                      - bare-metal hardware tests run inside the emulator (make hwtest)
 ```
 
 ---
@@ -202,7 +213,8 @@ the field number is the axis a DuckStation run can be put on too (count its `Now
 - WARN: recoverable anomalies, dropped commands
 - INFO: init, major state changes only
 - DEBUG: register writes, IRQ events, command dispatch
-- TRACE: per-instruction, per-transfer, per-primitive (hot path — never in default builds)
+- TRACE: per-instruction, per-transfer, per-primitive (hot path, never in default builds: compiled
+  out unless built with `make LOG_MAX_LEVEL=TRACE`, see `ZS1_LOG_AT` in `include/log.h`)
 - No counter-based rate-limiting — use level gating
 
 Key format conventions:
@@ -375,10 +387,10 @@ The project is **GPL-3.0-or-later**; every source file carries an SPDX header an
 - GTE: all 22 ops with cycle costs charged to the CPU
 - I-Cache: 256-line 4-word with tag/valid bits
 - SPU: sample generation on the emulated clock (EVQ_SPU event + catch-up on register access)
-- **Savestates**: full machine, format **v6**. F5 saves, F8 loads, `emu.save_state`/`emu.load_state`
-  from Lua. Older states are refused: the SIOI section (SIO0 protocol state) arrived in v3, v4 moved
-  Cdrom fields, v5 added the pad's stick mode inside SIOI, v6 added the drive's response deadlines
-  inside the raw CDRH range.
+- **Savestates**: full machine, format **v12** (every bump is listed above `ZS1_STATE_VERSION` in
+  `savestate.c`). F5 saves, F8 loads, `emu.save_state`/`emu.load_state` from Lua. Older states are
+  refused. v12 (2026-10-02): the CPU trace ring shrank, the SPU gained its manual-write FIFO, and a
+  save reads the renderer's VRAM back first, so pixels only the rasteriser wrote survive a load.
 - CPU memory timing: RAM data **loads** cost 3 cycles (1 documented from RAM_SIZE bit 7, 2
   calibrated); stores are free because the write buffer absorbs them. CPI lands ~1.6, tracked and
   printed by `ZS1_FRAME_PROFILE=1`. This is what stopped the BIOS printing `VSync: timeout` on
@@ -438,6 +450,10 @@ The project is **GPL-3.0-or-later**; every source file carries an SPDX header an
   device in the clear and points at the SPU's own clock. Do not quote a drift figure from a run with
   logging or a probe on — see the trap below; a guest burning cycles in a retry loop and a host that
   cannot keep up look identical here and need opposite fixes.
+  **2026-10-02:** the documented candidates are fixed (XA filter routing, the drive feeding XA under
+  a pending INT, SPU IRQ address and loops, volume sweeps, Mute/ATV/AVOL; CHANGELOG of that date),
+  and none of it has been re-tested on the disc yet. `scripts/cutscene_audio_classify.lua`, run from
+  a savestate just before the cutscene, says which audio mechanism the scene uses.
 - **SPU pops during speech** — the open defect. Sounds like clipping, but the final mix peaks far
   below full scale (5869/6343 of 32767 observed), so any saturation is at an intermediate stage.
   `scripts/spu_clip_probe.lua` reports the reverb network's in/out peaks and rail hits alongside the
@@ -449,14 +465,14 @@ The project is **GPL-3.0-or-later**; every source file carries an SPDX header an
   corrected (unsized `GL_RGB` scanout target, float-to-uint on a possibly-negative interpolated UV,
   `GL_DITHER` left enabled). The UV fix alone was tested and did not resolve it; the format fix is
   the one that had not been tried when that was reported. Needs an iGPU run to confirm.
-- GPU: mask-bit *test* not applied to rasterized primitives; GP0(C0)/GP0(80) read the CPU-side VRAM;
-  texture sampling reads a separate mirror; CRTC ticks once per frame.
-- **Display window is computed from the wrong register.** Hardware derives the width from GP1(06),
-  `(((X2-X1)/cycles_per_pix)+2) AND NOT 3` (`DOCS/graphicsprocessingunitgpu.md:687-690`); we take it
-  from the GP1(08) resolution index and ignore GP1(06) entirely, so every PAL game with non-default
-  centering is displayed at a width it never asked for, and screen-shake via GP1(06)/(07) does
-  nothing. Height ignores the interlace doubling, GP1(05) X is masked to even halfwords, 368 mode
-  decodes as 256. Full list and the fix order in `docs/GPU_DISPLAY_STUDY_2026-08-10.md`.
+- GPU: CRTC ticks once per frame. (The mask-bit test is applied by both shaders, GP0(C0)/(80) read
+  the renderer back where it may have drawn, and the R16UI sampling mirror is used only on a driver
+  without ARB_texture_barrier.)
+- **Display window: size fixed, position still not applied.** Width comes from GP1(06) with the
+  divider table, height doubles only for interlaced 480 lines, GP1(05) X is no longer masked to even
+  and 368 mode decodes (`gpu.c:83-140`). Still open: the X1/Y1 position is ignored, so screen-shake via
+  GP1(06)/(07) stays invisible, and the overscan crop applies to NTSC only.
+  `docs/GPU_DISPLAY_STUDY_2026-08-10.md` has the full list.
 - **Display state is snapshotted at the end of the field**, at frame submit, and applied to the whole
   field; hardware latches per line. A game that changes depth or window part-way through a field gets
   one wrong field from us — visible as the stretched 15bpp-read-as-24bpp frame after an FMV.
@@ -566,6 +582,12 @@ matching their 442 data / 63 audio split. The reported "-30% drift and underruns
 **Next up, in order** (merged 2026-08-17 from both audits' findings and the display study; the two
 audit documents stay authoritative for the detail, this is only the sequence). Batches, not single
 items: everything inside a batch touches the same code and is verified by the same run.
+
+*Status 2026-10-02, checked against the code* (`docs/ANALISI_PERF_AUDIO_FMV_2026-10-02.md` and its
+annexes): closed are 1, 2, 3, 4 (the matrix is now applied in the mix), 6, 7, 8, 9, 14, 15 and 20;
+12 is partial (overscan crop for NTSC only) and 23 mostly done (readbacks exist, the mirror is
+fallback-only). Open: 5, 10 (a field-start latch was tried and switched off), 11, 13, 16, 17, 18, 19,
+21.
 
 **A. Free correctness — one-liners, no behaviour risk** (do first: they remove noise from every
 measurement after them)
@@ -699,10 +721,11 @@ has to be there. Re-run before a release rather than trusting this line.
   like it had no effect, which invalidated most of a session — including three "measurements" taken
   against a day-old binary. `.DEFAULT_GOAL := all` fixes it. If a change ever seems to do nothing,
   check the binary's mtime before checking the change.
-- `make test` is broken and was already broken before this: `tests/` is an empty directory, though
-  this file and the Makefile both reference `tests/cpu_minimal_test.c`. **There is no automated test
-  of any kind in this repository** — every accuracy claim here was established by running a game and
-  reading a log. That is the single largest structural gap, and `docs/TESTING_PLAN_2026-08-20.md`
+- ~~`make test` is broken~~ Fixed 2026-10-02: `make test` runs eight unit tests (tests/*_test.c)
+  and `make hwtest` runs bare-metal PS-X EXEs inside the emulator on both renderers (tests/hw/),
+  layers 1 and 2 of the testing plan. Before that **there was no automated test of any kind in this
+  repository**, and there is still none at the level of a game (layer 3): every accuracy claim about
+  a title was established by running it and reading a log. That is the single largest structural gap, and `docs/TESTING_PLAN_2026-08-20.md`
   is the plan for closing it, written the day after the LWL/LWR bug showed what it costs: months
   live, most of a day to find, and sixteen assertions to have caught.
 - Never quote a speed figure measured with `ZS1_LOG_STDERR`, per-vblank Lua probes, or breakpoints

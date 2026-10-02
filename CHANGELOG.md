@@ -7,6 +7,166 @@ Format follows [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 
 ## [Unreleased]
 
+### 2026-10-02: follow-up of `docs/ANALISI_PERF_AUDIO_FMV_2026-10-02.md`
+
+Every item below rests on a psx-spx line (clone at commit `00d5dcb`, cited as `<path>:<line>`) or on
+a measurement in this environment. Nothing here was run against a BIOS or a disc: the checks are
+the unit tests (`make test`, 8 programs) and the new bare-metal hardware tests (`make hwtest`, 15
+checks on the OpenGL and the Vulkan renderer), which fail on the code before these changes and
+pass after them. The list of what still needs a real run is at the end of this block.
+
+#### Fixed: audio in in-engine cutscenes
+- **XA sectors the filter rejects are discarded, not handed to the CPU.** With the XA filter on, an
+  audio+realtime sector of another file or channel became an INT1 carrying ADPCM data and moved the
+  GetlocL location onto a channel the game was not playing: N-1 spurious interrupts in N on a
+  multi-channel dialogue bank, which is what an in-engine cutscene plays from. Routing now follows
+  the documented algorithm (cdr/cdromdrive.md:590-612): CD-DA and non-Mode 2 sectors never reach
+  the ADPCM decoder, and GetlocP follows every sector the head passes, with the LibCrypt rule
+  unchanged.
+- **The drive keeps feeding XA while an interrupt is pending.** Any unacknowledged INT, even the
+  INT3 of a polling GetlocP, stopped the whole drive and put holes in the speech; now only data
+  delivery waits for the acknowledge (:605, :758-765). `ZS1_CD_XA_HOLD=1` restores the old
+  behaviour.
+- **SPU streaming IRQs fire where the hardware fires them.** The voice IRQ compared IRQA with the
+  block after the one read, so an IRQ address at the start of a looping buffer never fired and a
+  double-buffered stream never refilled; writing IRQA or TSA raised IRQs no access caused; and
+  acknowledging I_STAT also cleared the SPU's own flag. The IRQ now traps the block being read,
+  silent voices keep reading and can raise it, and only SPUCNT.6 = 0 acknowledges it
+  (spu/soundprocessingunitspu.md:635, :823-852).
+- **SPU loops follow the ADPCM flags as documented.** Key On no longer forgets a repeat address
+  written before it, Loop End always jumps to it, and a software write no longer disables Loop Start
+  flags until the next Key On (:131-182). A streaming ring without a Loop Start flag used to play
+  once and go silent.
+- **Volume sweeps are the documented envelope.** A linear fade-out ran past 0 and came back at full
+  volume with the phase inverted, heard as the previous scene's sound returning; it now stops at 0,
+  the phase bit and the exponential increase steps work (:447-482), and the main volume sweeps at
+  all (:405-432), so a scene that fades in from 0 is no longer silent.
+- **Mute, ADPMUTE, the ATV matrix and a CD volume of 0 now act.** The CD controller's output stage
+  had no caller and AVOL 0 played at full volume, so audio a game had silenced stayed audible across
+  a cut. SPUCNT.14 now mutes the voices and leaves the CD alone (:631). A one-time INFO line says so
+  if CD audio arrives while AVOL is 0.
+- **Uploads written in Stop mode reach SPU RAM.** The documented manual-write sequence fills the
+  FIFO before selecting Manual Write (:715-721); those halfwords were dropped.
+- **AutoPause, Read after Pause and ADPBUSY.** AutoPause compares this sector's SubQ track with the
+  previous one instead of a function-static that paused a new Play at its first sector; Read after
+  Pause returns the last received sector again (cdr/cdromdrive.md:811-814); HSTS.2 reports XA
+  playback (:62).
+
+#### Fixed: FMV and GPU
+- **The MDEC reset keeps the quant and scale tables.** The reset bit zeroed them, so a game that
+  resets between two movies without re-sending them decoded the second as flat grey
+  (cpu/mdec/macroblockdecodermdec.md:116-117).
+- **MDEC(0) and MDEC(4..7) take no parameters.** They swallowed cw&FFFFh words: FE00h padding read
+  as a command (FE00FE00h) ate the next frame whole. Status bits 15-0 now read words remaining minus
+  1, FFFFh when idle, the MDEC(0) count, 0000h after reset (:43, :58, :119-126).
+- **FMV colours are clipped where the documentation clips them.** The IDCT output is no longer cut
+  to 9 bits block by block, chroma included; Y+R, Y+G, Y+B saturate after the sum (:235-238). The
+  literal 9-bit wrap is available with `ZS1_MDEC_WRAP9=1`: taken as written it turns a Y+R above 255
+  black, and no hardware capture confirms it. Signed output no longer smears G and B, and the IDCT
+  uses the upper 13 bits of the scale table (:317-318).
+- **GP0(02h) fills reach the screen exactly.** They were rasterised as quads, clipped to the drawing
+  area and passed through GP0(E6h): a 24bpp FMV buffer cleared wider than the drawing area stayed
+  dirty on screen, and with E6h.0 set black came out as 8000h. A fill is now a VRAM write pushed to
+  the renderer as an upload.
+- **VRAM transfers wrap at the edges of VRAM.** GP0(A0h) dropped pixels past column 1023 or line
+  511, and rectangles hanging past line 511 made the renderers read past the end of the CPU copy of
+  VRAM. GP0(A1h..BFh) and (C1h..DFh) now act as A0h/C0h (gpu/memory-transfer-commands.md:3-5,
+  :95-98).
+- **With GP0(E6h).1 set, uploads and copies test the real destination.** The mask bit was read from
+  the CPU copy, which never holds rasterised pixels.
+- **On Vulkan, GP0(80h) and GP0(C0h) read the current field and write the right place.** The
+  synchronous readback ignored the primitives drawn so far in the field, and wrote the rect packed
+  at the top-left of VRAM instead of in place. It now replays the pending ops first and writes in
+  place like GL; its buffer no longer outlives the device across a renderer switch. The texture
+  window offset is also ANDed with its mask, as on GL (gpu/rendering-attributes.md:110).
+- **An empty drawing area draws nothing on GL** (gpu/rendering-attributes.md:139-140); it was
+  widened to a one-pixel column.
+- **Savestates keep what the renderer drew.** The save reads the whole of VRAM back first; a screen
+  drawn once and left came back empty after a load. Format version 12: v11 states are refused.
+- **DMA MADR and BCR follow the transfer** (system/dmachannels.md:23-32, :56-58), and a DPCR write
+  no longer restarts a GPU transfer that is still running, which sent its data twice. 16-bit reads
+  of the MDEC status' upper half no longer read 0.
+- **GP1(10h) answers the right register.** The indices were one off (index 4 returned the top left
+  of the drawing area); GPUREAD keeps its value across reads and GP1(40h..FFh) mirror GP1(00h..3Fh).
+
+#### Fixed: CPU
+- **SWL/SWR no longer read memory.** Hardware drives byte enables and reads nothing
+  (cpu/cpuspecifications.md:284-287); the read-modify-write charged a load stall on RAM and could
+  read an I/O register for real.
+- **The BIOS TTY capture no longer perturbs the machine.** It read guest strings through the CPU's
+  load path, charging stalls and tripping watchpoints; it now peeks RAM and ROM.
+- **Timer MODE reads see a boundary already crossed**, as counter reads do.
+
+#### Performance
+- **Emulation no longer waits for the previous field's buffer swap.** `main.c` waited for the GPU
+  thread before emulating, so a swap blocked on vblank was added to every field instead of
+  overlapping it. The wait now protects only ImGui's draw data and sits after emulation.
+  `ZS1_VSYNC=0|1|-1` sets the GL swap interval or the Vulkan present mode for a repeatable A/B; unset
+  changes nothing.
+- **`ZS1_FRAME_PROFILE` shows the waits.** The `[PROF]` line keeps its fields and `CPI=` and
+  appends `wait`, `ui`, `upload`, `pace` and `frame`, plus a `*_max` for each.
+- **The GL backend stops uploading 2 MB of VRAM nobody reads.** With a texture barrier the R16UI
+  mirror has no reader, so the per-field and after-fill full uploads, which could also run the pool
+  out and drop real uploads, are skipped.
+- **GL batches cost a fraction of the GL calls**: vertices go up once per replay, draws start at
+  their own offset, the texture barrier runs only before a batch that reads VRAM after a write, and
+  state is set only when it changes. **Vulkan batches like GL**: its setters flushed unconditionally,
+  so every primitive was a batch with its own barrier.
+- **GP0(80h) and GP0(C0h) read VRAM back only where something may have been drawn**, from a map of
+  16x16 tiles; `ZS1_FORCE_READBACK=1` restores the old behaviour.
+- **The interpreter does less per instruction**: switch dispatch, inline register access, an 8 KB
+  exec trace instead of 64 KB, no debugger call when nothing is set, Cause written only when it
+  changes. **CPU loads from RAM take a fast path** with the same value, stall and watchpoint
+  behaviour; the DMA loops are deliberately untouched. CPI is unchanged.
+- **Log lines that cannot print cost nothing**: the level test moved to the call site, TRACE is
+  compiled out unless built with `make LOG_MAX_LEVEL=TRACE`, and log files are fully buffered and
+  flushed per field and on any crash signal.
+- **MDEC decoding is about 2.7x cheaper**, bit-exact with the previous structure; GP0(A0h) does one
+  division per word instead of four; the SPU skips idle key scans, reverb modulos and zero FIR taps
+  with identical arithmetic; the VRAM viewer pass runs only while the viewer is open.
+- **LTO stays on for C when gcc and g++ differ in major version** (C objects with LTO, C++ without,
+  linked by the C driver), and `make PGO_GEN=1` / `make PGO_USE=1` build a profile-guided binary.
+- **Lua probes subscribe to the events they need**: `emu.on_event(fn, "vblank", ...)` filters in C.
+
+#### Fixed: the cluster's audio path (`deploy/session/`)
+- **Chrome decodes the session audio in stereo.** `webrtc.html` asks for `stereo=1`, without which
+  libwebrtc decodes Opus as mono; the page also shows the audio stream's bitrate, jitter-buffer
+  delay, concealed share and channel count.
+- **Audio drops are counted, and a 20 ms stall no longer drops audio.** The audio queue is
+  time-bounded at 60 ms and logs its drops every 10 s.
+- **Opus settings come from `ZS1_WEBRTC_AUDIO_*`**; the manifests use 20 ms frames on the WAN (116
+  kbit/s on the wire instead of 136 for the same payload).
+- **One resample, always in the same place**: the null sink is created at 48 kHz with
+  speex-float-5. ffmpeg's `-fragment_size` is in bytes, so 480 was 2.5 ms; it is 1920 (10 ms).
+- **Session pods request one CPU** (Burstable instead of BestEffort). SDL stays at 3.2.24; the
+  3.4.0 measurement is written in the Dockerfile.
+
+#### Added
+- **`make test`** builds and runs eight self-contained unit tests (CPU decode, RAM fast path and
+  SWL/SWR, log gating, MDEC, VRAM rectangle split and tile map, DMA writeback, SPU, CDROM); the old
+  target pointed at a file that did not exist.
+- **`make hwtest`** runs bare-metal PS-X EXEs inside the emulator on a zero BIOS, on both renderers
+  (`tests/hw/`, needs `gcc-mipsel-linux-gnu` and `xvfb-run`).
+- **`ZS1_DMA_STALL=doc`, a documented DMA cost model (opt-in).** DMA no longer charges the CPU a
+  load stall per word read; the CPU keeps running and waits only when it reads RAM or I/O during a
+  transfer (system/dmachannels.md:205-238). Off by default because it changes emulated timing.
+- **Capture buffers in SPU RAM** (CD left/right, voices 1 and 3, with IRQ), **`emu.spu_voice(n)`,
+  `emu.spu_irq()`, `emu.cd_state()`**, **`scripts/cutscene_audio_classify.lua`**, and
+  **`ZS1_SPU_RING_TARGET=<frames>`**. `audio_timeline.lua` and `spu_pop_capture.lua` read
+  `emu.cd_audio()` in its real order.
+
+#### Needs a run with a BIOS and a disc
+- **A CD volume of 0 now means silence.** If a title relied on the old "0 = full", its XA or CD-DA
+  is now silent; the one-time INFO line in the log says so. Check the BIOS CD player, Ace Combat 2's
+  FMV and Dino Crisis.
+- **The LSAX latch is gone (SPU loops).** psx-spx does not describe it, but
+  `docs/study/SPU_2026-07-29.md` records that another emulator keeps one; first suspect if a game
+  loses a loop.
+- **The main-loop reorder (P1)** should be measured with `ZS1_FRAME_PROFILE=1` (now with `wait=`)
+  on both GPUs, with and without `ZS1_VSYNC=0`.
+- **`ZS1_DMA_STALL=doc`** needs boot milestones in emulated fields against the reference run
+  before it can become the default.
+
 ### Performance
 Host cost per PAL field, measured with `ZS1_FRAME_PROFILE` and nothing else, median of three 30 s
 runs of the same scenario. The emulated machine is unchanged throughout: CPI stays at 1.618 with

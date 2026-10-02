@@ -38,7 +38,7 @@ make
 compile time — the headers and a shader compiler:
 
 ```sh
-sudo apt install libvulkan-dev glslang-tools     # vulkan-tools too, for vulkaninfo
+sudo apt install libvulkan-dev glslang-tools xxd # vulkan-tools too, for vulkaninfo
 ```
 
 Missing either one, `make` prints which one it wanted and builds the OpenGL backend alone; the
@@ -62,6 +62,15 @@ finds it through `pkg-config sdl3`.
 ImGui and Lua are vendored in `third_party/`. `make` is parallel by default and tracks header
 dependencies, so `make clean` is not needed after editing a header. `make DEBUG=1` gives an `-O0 -g`
 build for gdb.
+
+`make test` builds and runs the unit tests in `tests/`, which need no SDL, BIOS or disc. `make hwtest`
+runs the bare-metal hardware tests in `tests/hw/` inside the emulator, on a zero-filled BIOS and on
+both renderers; it needs a MIPS cross compiler and Xvfb (Mesa's software renderers are enough):
+
+```sh
+sudo apt install gcc-mipsel-linux-gnu xvfb mesa-vulkan-drivers
+make test && make hwtest
+```
 
 ## Run
 

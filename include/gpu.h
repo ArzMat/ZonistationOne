@@ -178,7 +178,8 @@ typedef struct Gpu { // Define struct Gpu
     // Set by GP0(02h) to make the next textured primitive re-upload all of VRAM.
     // A fill now reaches the renderer as an upload of its own rectangle, so
     // nothing sets or reads it; the field stays so the saved Gpu span keeps
-    // its layout.
+    // its layout. Where the renderer may be ahead of the CPU copy is tracked
+    // by vram_raster_*() in vram.c instead.
     bool vram_dirty;
 
     // --- GP1 Info Latch (for GP1(0x10) GetGPUInfo responses) ---

@@ -158,15 +158,46 @@ static int trace_batch_enabled(void) {
 //
 // gpu.vram.data holds what the CPU, DMA and MDEC wrote; what the rasteriser
 // drew exists only in the renderer. GP0(80h) and GP0(C0h) need the real pixels,
-// so the rectangle is read back first, as its in-bounds pieces.
+// and a readback is a synchronous round trip through the GPU thread (on GL it
+// also waits for the previous field, swap included). vram.c keeps a 16x16-tile
+// map of where the rasteriser may have drawn since the CPU copy was last made
+// authoritative there; a rectangle with no such tile is already right in
+// gpu.vram.data and is not read back.
+//
+// Marking is conservative: every rasterised primitive marks the whole drawing
+// area it is clipped to (gpu_note_raster). Tiles are cleared only where the CPU
+// copy has been pushed to the renderer or pulled back from it in full.
+// ZS1_FORCE_READBACK=1 reads back every time, as before, for the A/B.
 // ---------------------------------------------------------------------------
+static bool force_readback(void) {
+    static int cached = -1;
+    if (cached < 0) {
+        const char* v = getenv("ZS1_FORCE_READBACK");
+        cached = (v && v[0] == '1') ? 1 : 0;
+        if (cached) LOG_GPU_INFO("[GPU] ZS1_FORCE_READBACK=1: every GP0(80h)/(C0h) reads VRAM back");
+    }
+    return cached != 0;
+}
+
+/* A rasterised primitive is about to be submitted: it can only land inside the
+ * drawing area: "The Render commands GP0(20h..7Fh) are automatically clipping
+ * any pixels that are outside of this region" (psx-spx
+ * gpu/rendering-attributes.md:139-140). */
+static inline void gpu_note_raster(const Gpu* gpu) {
+    vram_raster_mark_area(gpu->drawing_area_left, gpu->drawing_area_top,
+                          gpu->drawing_area_right, gpu->drawing_area_bottom);
+}
 
 /* Make the CPU copy authoritative for a (possibly wrapped) rectangle. */
 static void gpu_vram_pull(Gpu* gpu, uint32_t x, uint32_t y, uint32_t w, uint32_t h) {
     VramRect p[4];
     const int n = vram_split_rect(x, y, w, h, p);
-    for (int i = 0; i < n; i++)
-        renderer_read_vram_rect(&gpu->renderer, vram16(gpu), p[i].x, p[i].y, p[i].w, p[i].h);
+    const bool force = force_readback();
+    for (int i = 0; i < n; i++) {
+        if (!force && !vram_raster_any(p[i].x, p[i].y, p[i].w, p[i].h)) continue;
+        if (renderer_read_vram_rect(&gpu->renderer, vram16(gpu), p[i].x, p[i].y, p[i].w, p[i].h))
+            vram_raster_clear(p[i].x, p[i].y, p[i].w, p[i].h);
+    }
 }
 
 /* Push a (possibly wrapped) rectangle of the CPU copy to the renderer. It goes
@@ -175,12 +206,14 @@ static void gpu_vram_pull(Gpu* gpu, uint32_t x, uint32_t y, uint32_t w, uint32_t
  * the buffer, and one past column 1023 wrote the wrong pixels
  * (psx-spx gpu/memory-transfer-commands.md:95-98). renderer_upload_vram_rect()
  * flushes the primitives still pending first, so the write keeps its place in
- * the order. */
+ * the order. Afterwards the CPU copy is authoritative in the rectangle. */
 static void gpu_vram_push(Gpu* gpu, uint32_t x, uint32_t y, uint32_t w, uint32_t h) {
     VramRect p[4];
     const int n = vram_split_rect(x, y, w, h, p);
-    for (int i = 0; i < n; i++)
+    for (int i = 0; i < n; i++) {
         renderer_upload_vram_rect(&gpu->renderer, vram16(gpu), p[i].x, p[i].y, p[i].w, p[i].h);
+        vram_raster_clear(p[i].x, p[i].y, p[i].w, p[i].h);
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -1074,6 +1107,7 @@ static void flush_polyline(Gpu* gpu) {
     }
     LOG_GPU_TRACE("[GPU] Polyline: flush with %u entries", gpu->polyline_count);
 
+    gpu_note_raster(gpu);
     renderer_set_semi_trans_mode(&gpu->renderer, gpu->polyline_semi_trans,
                                   gpu->semi_transparency);
 
@@ -1738,6 +1772,11 @@ static void gpu_gp0_handle_word(Gpu* gpu, uint32_t word) {
     if (gpu->gp0_words_remaining == 0) {
         if (gpu->gp0_current_opcode >= 0x20 && gpu->gp0_current_opcode <= 0x3F)
             lua_debug_notify("gp0_poly_complete");
+        /* Polygons, lines and rectangles (20h..7Fh) are the only commands that
+         * rasterise; polylines are drawn later by flush_polyline, which marks
+         * again. */
+        if (gpu->gp0_current_opcode >= 0x20 && gpu->gp0_current_opcode <= 0x7F)
+            gpu_note_raster(gpu);
         if (gpu->gp0_command_method)
             gpu->gp0_command_method(gpu);
         if (gpu->gp0_mode == GP0_MODE_COMMAND)

@@ -27,7 +27,7 @@ means the documented behaviour, not just "no crash".
 
 | Suite | Checks |
 |---|---|
-| `gpu` | GP0(02h) fill outside the drawing area and with GP0(E6h).0 set; GP0(80h) copy of pixels rasterised in the same field; GP0(A0h) upload wrapping at the right edge of VRAM. Every area is dirtied by a primitive first, so the readback comes from the renderer, not from the CPU copy of VRAM. |
+| `gpu` | GP0(02h) fill outside the drawing area and with GP0(E6h).0 set; GP0(80h) copy of pixels rasterised in the same field; GP0(A0h) upload wrapping at the right edge of VRAM; two overlapping rectangles under set-mask plus check-mask. Every area is dirtied by a primitive first, so the readback comes from the renderer, not from the CPU copy of VRAM. The mask check passes on Mesa's software rasterisers with or without the fix it guards (they run primitives in order); it is there for real GPUs. |
 | `mdec` | Decode completes; status bits 15-0 read FFFFh after a command; the reset bit keeps the quant and scale tables; FE00h padding after a finished MDEC(1) is not taken as a parameter count. |
 | `dma` | A SyncMode 1 transfer leaves MADR at the end address and BA at zero; the data reaches VRAM. |
 | `spu` | The voice IRQ fires every time a looping voice reads the block at IRQA; a Loop End jumps to a repeat address written before Key On; the documented manual-write sequence (Stop, address, FIFO, Manual) lands in SPU RAM; the main volume sweeps. |

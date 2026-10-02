@@ -1276,13 +1276,33 @@ Le correzioni sono sul branch `claude/wizardly-planck-fb7ppi`; il dettaglio è n
   mascherato; su GL un'area di disegno vuota disegnava una colonna di un pixel; una scrittura di DPCR
   faceva ripartire un trasferimento GPU già in corso, che inviava i dati due volte.
 
+### Revisione indipendente del lavoro unito
+
+Una revisione separata del diff completo ha trovato otto punti, tutti corretti:
+
+- un salvataggio durante un upload GP0(A0h) perdeva i pixel già ricevuti;
+- con `ZS1_DMA_STALL=doc` le letture della CPU dalla RAM, passando dal percorso veloce, non
+  aspettavano mai il DMA;
+- il latch su LSAX era stato tolto del tutto, e questo rompeva il reindirizzamento di un campione
+  in riproduzione;
+- primitive sovrapposte nella stessa chiamata di disegno potevano leggere la VRAM ancora vecchia
+  (test della maschera, texture dentro l'area di disegno);
+- due stati del DMA tenuti fuori dalla struttura sopravvivevano al caricamento di un savestate;
+- un cambio di backend senza readback partiva con la VRAM vuota;
+- un upload interrotto da GP1(01h)/(00h) non arrivava mai al renderer;
+- le letture strette della porta dati MDEC consumavano una parola ciascuna.
+
+Ha anche confermato pulite le aree più delicate: marcatura delle tile, readback dopo il riordino del
+main loop, thread, gating dei log, instradamento dei settori CD, writeback DMA, MDEC, SWL/SWR.
+
 ### Da verificare con BIOS e disco
 
 1. **Volume CD a 0 = silenzio.** È quello che dice la doc, ma se un gioco si affidava al vecchio
    "0 = volume pieno", ora il suo XA o CD-DA tace; una riga INFO nel log lo segnala. Da provare: il
    lettore CD del BIOS, gli FMV di Ace Combat 2, Dino Crisis.
-2. **Loop della SPU senza il latch su LSAX.** La doc non lo descrive, ma `docs/study/SPU_2026-07-29.md`
-   ricorda che un altro emulatore lo tiene: è il primo sospetto se un gioco perde un loop.
+2. **Loop della SPU.** Key On non azzera più l'indirizzo di ripetizione, e il latch su LSAX segue
+   la regola dell'emulatore di riferimento (`docs/study/SPU_2026-07-29.md`, finding 11). Nessuna
+   delle due cose è nella doc: sono il primo sospetto se un gioco perde un loop.
 3. **Le cinematiche 3D di Dino Crisis:** prima `scripts/cutscene_audio_classify.lua` da un
    savestate appena prima della scena, poi l'ascolto.
 4. **P1 e vsync:** `ZS1_FRAME_PROFILE=1` (ora con `wait=`) su entrambe le GPU, con e senza

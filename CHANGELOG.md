@@ -34,9 +34,12 @@ pass after them. The list of what still needs a real run is at the end of this b
   silent voices keep reading and can raise it, and only SPUCNT.6 = 0 acknowledges it
   (spu/soundprocessingunitspu.md:635, :823-852).
 - **SPU loops follow the ADPCM flags as documented.** Key On no longer forgets a repeat address
-  written before it, Loop End always jumps to it, and a software write no longer disables Loop Start
-  flags until the next Key On (:131-182). A streaming ring without a Loop Start flag used to play
-  once and go silent.
+  written before it, and Loop End always jumps to it (:131-182). A streaming ring without a Loop
+  Start flag used to play once and go silent. A software write of the repeat address latches "ignore
+  Loop Start" until the next Key On only when the voice is off or past its first block, the rule the
+  reference emulator settled on with games (docs/study/SPU_2026-07-29.md, finding 11): a redirect to
+  a silent loop works (:142-147), and a write right after Key On no longer breaks the sample's own
+  loop.
 - **Volume sweeps are the documented envelope.** A linear fade-out ran past 0 and came back at full
   volume with the phase inverted, heard as the previous scene's sound returning; it now stops at 0,
   the phase bit and the exponential increase steps work (:447-482), and the main volume sweeps at
@@ -81,6 +84,13 @@ pass after them. The list of what still needs a real run is at the end of this b
   window offset is also ANDed with its mask, as on GL (gpu/rendering-attributes.md:110).
 - **An empty drawing area draws nothing on GL** (gpu/rendering-attributes.md:139-140); it was
   widened to a one-pixel column.
+- **A primitive that may read what its own draw call writes gets a call of its own**, with the
+  barrier in front: one under the mask test, or a textured one whose page or CLUT lies inside the
+  drawing area. Inside one call the order between drawing and sampling is undefined on a real GPU.
+- **Uploads survive a save and an abort.** Saving while a GP0(A0h) upload was still receiving words
+  replaced the pixels already received; an upload cut short by GP1(01h)/(00h) never reached the
+  renderer; a renderer switch whose readback was refused started empty. All three now keep the
+  pixels.
 - **Savestates keep what the renderer drew.** The save reads the whole of VRAM back first; a screen
   drawn once and left came back empty after a load. Format version 12: v11 states are refused.
 - **DMA MADR and BCR follow the transfer** (system/dmachannels.md:23-32, :56-58), and a DPCR write
@@ -149,7 +159,8 @@ pass after them. The list of what still needs a real run is at the end of this b
   (`tests/hw/`, needs `gcc-mipsel-linux-gnu` and `xvfb-run`).
 - **`ZS1_DMA_STALL=doc`, a documented DMA cost model (opt-in).** DMA no longer charges the CPU a
   load stall per word read; the CPU keeps running and waits only when it reads RAM or I/O during a
-  transfer (system/dmachannels.md:205-238). Off by default because it changes emulated timing.
+  transfer (system/dmachannels.md:205-238), the RAM fast path included. Off by default because it
+  changes emulated timing.
 - **Capture buffers in SPU RAM** (CD left/right, voices 1 and 3, with IRQ), **`emu.spu_voice(n)`,
   `emu.spu_irq()`, `emu.cd_state()`**, **`scripts/cutscene_audio_classify.lua`**, and
   **`ZS1_SPU_RING_TARGET=<frames>`**. `audio_timeline.lua` and `spu_pop_capture.lua` read
@@ -159,9 +170,9 @@ pass after them. The list of what still needs a real run is at the end of this b
 - **A CD volume of 0 now means silence.** If a title relied on the old "0 = full", its XA or CD-DA
   is now silent; the one-time INFO line in the log says so. Check the BIOS CD player, Ace Combat 2's
   FMV and Dino Crisis.
-- **The LSAX latch is gone (SPU loops).** psx-spx does not describe it, but
-  `docs/study/SPU_2026-07-29.md` records that another emulator keeps one; first suspect if a game
-  loses a loop.
+- **SPU loops.** Key On no longer resets the repeat address and the LSAX latch now follows the
+  reference emulator's rule; neither is in psx-spx, so this is the first suspect if a game loses a
+  loop or a sample loops in place.
 - **The main-loop reorder (P1)** should be measured with `ZS1_FRAME_PROFILE=1` (now with `wait=`)
   on both GPUs, with and without `ZS1_VSYNC=0`.
 - **`ZS1_DMA_STALL=doc`** needs boot milestones in emulated fields against the reference run

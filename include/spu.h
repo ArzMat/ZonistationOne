@@ -31,8 +31,23 @@ struct Interconnect;
  * device drains 44100 per real second while the emulator produces 44100 per
  * emulated second; without a cushion any jitter in frame pacing empties the
  * ring and the callback plays silence. ~46 ms is small enough not to be felt
- * and large enough to ride out a frame's worth of scheduling noise. */
-#define SPU_RING_TARGET_SAMPLES 2048
+ * and large enough to ride out a frame's worth of scheduling noise.
+ *
+ * 2048 is the default. ZS1_SPU_RING_TARGET=<frames> overrides it, read once:
+ * where the device is a null sink on the same clock as the encoder (the
+ * streaming pod), the cushion is pure latency and a smaller one puts the sound
+ * back in step with the picture. The value is clamped to
+ * [SPU_RING_TARGET_MIN, SPU_RING_TARGET_MAX] so the ring itself never has to
+ * change size: the pacer lets the ring reach the target plus one field of
+ * production (882 samples at 50 Hz), and that has to stay below the 4095 the
+ * ring can hold. The name stays a macro because the host loop and the stretch
+ * controller use it as a value. */
+#define SPU_RING_TARGET_DEFAULT 2048
+#define SPU_RING_TARGET_MIN     512                              /* one device quantum */
+#define SPU_RING_TARGET_MAX     (SPU_SAMPLE_BUFFER_SIZE - 1024)  /* a field of headroom */
+#define SPU_RING_TARGET_SAMPLES (spu_ring_target_samples())
+/* Read once; spu_init() latches it before the audio thread exists. */
+int spu_ring_target_samples(void);
 #define TRANSFER_TICKS_PER_HALFWORD 16
 #define CAPTURE_BUFFER_SIZE     0x400       /* halfwords per channel */
 #define NUM_CAPTURE_CHANNELS    4

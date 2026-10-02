@@ -104,8 +104,15 @@ static uint32_t rev_addr(const Spu* spu, int32_t off_hw) {
     int32_t base = (int32_t)spu->reverb_base * 4;
     if (base < 0 || base >= end) base = 0;
     const int32_t span = end - base;
-    int32_t a = ((int32_t)spu->reverb_current_addr + off_hw - base) % span;
-    if (a < 0) a += span;
+    int32_t a = (int32_t)spu->reverb_current_addr + off_hw - base;
+    /* About 30 of these per 22050 Hz step. The offset nearly always lands
+     * inside the work area already, and there `%` is the identity, so the
+     * division is only paid when it would change something; the result is
+     * the same in every case. */
+    if ((uint32_t)a >= (uint32_t)span) {
+        a %= span;
+        if (a < 0) a += span;
+    }
     return (uint32_t)(base + a);
 }
 
@@ -246,12 +253,16 @@ static const int32_t s_rev_fir[39] = {
      0x0023, 0x0000, -0x000A, 0x0000,  0x0002, 0x0000, -0x0001
 };
 
-/* Downsample 44100 -> 22050: full 39-tap FIR over the input ring, window
- * ending at the current (odd) position. >>15 for unity gain. */
+/* Downsample 44100 -> 22050: the 39-tap FIR over the input ring, window
+ * ending at the current (odd) position. >>15 for unity gain.
+ *
+ * Eighteen of the 39 taps are zero: every odd one except the centre (k = 19).
+ * The sum skips them, which leaves it exactly what the full loop computed, with
+ * 21 multiplies instead of 39. */
 static int32_t rev_fir_down(const int16_t* ring /*[128], doubled at +64*/, int pos) {
     int base = (pos - 38) & 0x3F;
-    int64_t acc = 0;
-    for (int k = 0; k < 39; k++)
+    int64_t acc = (int64_t)s_rev_fir[19] * ring[base + 19];
+    for (int k = 0; k < 39; k += 2)
         acc += (int64_t)s_rev_fir[k] * ring[base + k];
     return clamp16((int32_t)(acc >> 15));
 }
@@ -626,6 +637,34 @@ int spu_get_samples(Spu* spu, int16_t* buffer, int max_samples) {
  * needs to serve this callback and leaves the rest of the queue in the ring
  * where the pacer can see it. */
 #define STRETCH_HOLD_MARGIN    640
+
+/* SPU_RING_TARGET_SAMPLES, see include/spu.h. Read once and clamped so the ring
+ * size is never in question; spu_init() calls this first, on the emulation
+ * thread, so the audio thread only ever reads the latched value. */
+int spu_ring_target_samples(void) {
+    static int s_target = 0;
+    if (s_target == 0) {
+        int target = SPU_RING_TARGET_DEFAULT;
+        const char* env = getenv("ZS1_SPU_RING_TARGET");
+        if (env && *env) {
+            char* end = NULL;
+            long v = strtol(env, &end, 10);
+            if (end != env) {
+                if (v < SPU_RING_TARGET_MIN) v = SPU_RING_TARGET_MIN;
+                if (v > SPU_RING_TARGET_MAX) v = SPU_RING_TARGET_MAX;
+                target = (int)v;
+                LOG_SPU_INFO("[SPU] Output ring target %d frames (ZS1_SPU_RING_TARGET=%s, "
+                             "range %d-%d)", target, env,
+                             SPU_RING_TARGET_MIN, SPU_RING_TARGET_MAX);
+            } else {
+                LOG_SPU_WARN("[SPU] ZS1_SPU_RING_TARGET=%s is not a number, keeping %d",
+                             env, target);
+            }
+        }
+        s_target = target;
+    }
+    return s_target;
+}
 
 /* Queue depth the tempo controller aims for, counting everything between the
  * mixer and the device: what the pacer parks in the ring, plus the margin above,

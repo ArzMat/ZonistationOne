@@ -31,6 +31,9 @@ static int spu_offset_for_addr(uint32_t addr) {
 
 void spu_init(Spu* spu) {
     if (!spu) return;
+    /* Latch ZS1_SPU_RING_TARGET here, on the emulation thread and before the
+     * audio device (and with it the thread that also reads the value) exists. */
+    (void)spu_ring_target_samples();
     memset(spu, 0, sizeof(Spu));
     spu_reverb_init(spu);
     spu_stretch_reset(&spu->stretch);
@@ -57,6 +60,10 @@ void spu_reset(Spu* spu) {
  * ========================================================================= */
 
 void spu_process_key_on_off(Spu* spu) {
+    /* Runs once per output sample and nearly always finds both latches empty:
+     * nothing below does anything then, so skip the two 24-voice scans. */
+    if (!(spu->key_on | spu->key_off)) return;
+
     /* Process key off first */
     for (int v = 0; v < NUM_VOICES; v++) {
         if (spu->key_off & (1u << v)) {

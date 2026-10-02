@@ -183,7 +183,7 @@ typedef struct Gpu { // Define struct Gpu
     bool vram_dirty;
 
     // --- GP1 Info Latch (for GP1(0x10) GetGPUInfo responses) ---
-    uint32_t gpu_info_latch;          // Data returned by GPUREAD after GP1(0x10) info request
+    uint32_t gpu_info_latch;          // GPUREAD latch: the last GP1(0x10) result or VRAM word, re-readable
 
     // --- Polyline State (GP0(0x48/0x58) polyline accumulation) ---
     uint32_t polyline_buffer[256];    // Vertex+color words accumulated for current polyline

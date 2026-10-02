@@ -885,10 +885,14 @@ void vkr_set_screen_scale(VkRenderer* r, uint16_t w, uint16_t h) {
 
 void vkr_set_texture_window(VkRenderer* r, uint8_t mx, uint8_t my, uint8_t ox, uint8_t oy) {
     /* GP0(E2) gives masks in 8-pixel units. The shader wants the AND/OR pair
-     * ready to use, so the arithmetic happens once here, as it does in GL. */
+     * ready to use, so the arithmetic happens once here, as it does in GL:
+     * "Texcoord = (Texcoord AND (NOT (Mask * 8))) OR ((Offset AND Mask) * 8)"
+     * (psx-spx gpu/rendering-attributes.md:110). The offset used to go in
+     * without the AND, so offset bits outside the mask were ORed into every
+     * coordinate on Vulkan and not on GL. */
     const int32_t tw[4] = {
         (int32_t)(~(mx * 8) & 0xFF), (int32_t)(~(my * 8) & 0xFF),
-        (int32_t)((ox * 8) & 0xFF),  (int32_t)((oy * 8) & 0xFF),
+        (int32_t)(((ox & mx) * 8) & 0xFF), (int32_t)(((oy & my) * 8) & 0xFF),
     };
     if (memcmp(r->cached_tex_window, tw, sizeof(tw)) == 0) return;
     VKR_FLUSH(r);

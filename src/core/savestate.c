@@ -379,6 +379,10 @@ bool savestate_load(const char* path, struct Cpu* cpu, struct Interconnect* inte
     memcpy(inter->memctrl_regs, ib.memctrl_regs, sizeof(ib.memctrl_regs));
     inter->bios_access_cycles = ib.bios_access_cycles;
 
+    /* State the MDEC keeps outside its saved span (the idle value of status
+     * bits 15-0) is re-derived rather than left at whatever this session had. */
+    mdec_state_restored(&inter->mdec);
+
     /* VBlank must always be in the queue. It is the frame boundary, the source
      * of IRQ0 and the only event that re-arms itself, so a state that lost it —
      * anything written from inside the dispatch, before the handler rescheduled

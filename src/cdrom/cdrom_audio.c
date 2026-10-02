@@ -61,6 +61,29 @@ void cdrom_audio_get_frame(AudioFifo *fifo, int16_t *left, int16_t *right) {
     }
 }
 
+static inline int16_t cdrom_audio_sat16(int32_t v) {
+    return (int16_t)(v < -32768 ? -32768 : (v > 32767 ? 32767 : v));
+}
+
+/* Output stage of the CD controller, between its decoder and the SPU's CD
+ * input (psx-spx cdr/cdromdrive.md:225-255):
+ *  - muted: "muting is just forcing the CD output volume to zero" (:1019-1022);
+ *    the caller decides whether Mute or ADPMUTE applies (:251);
+ *  - ATV0-ATV3: 80h is unity, "80h,0,80h,0" normal stereo and "40h,40h,40h,40h"
+ *    mono (:231-233), FFh about double (:240). "The saturation works up to
+ *    double volume" (:234-236): the sum is clamped to 16 bits. Past double the
+ *    hardware's saturation "does NOT work properly" (:237-238) in a way the
+ *    documentation does not describe, so it is clamped the same way there too.
+ * Nothing read these four registers before, so Spyro's mono option and
+ * Resident Evil 2's CD fades (:243-247) had no effect whatsoever. */
+void cdrom_audio_apply_output(int16_t *left, int16_t *right, bool muted,
+                              uint8_t ll, uint8_t lr, uint8_t rl, uint8_t rr) {
+    if (muted) { *left = 0; *right = 0; return; }
+    int32_t l = *left, r = *right;
+    *left  = cdrom_audio_sat16((l * (int32_t)ll + r * (int32_t)lr) >> 7);
+    *right = cdrom_audio_sat16((l * (int32_t)rl + r * (int32_t)rr) >> 7);
+}
+
 /* =========================================================================
  * XA-ADPCM Decoder (unchanged)
  * ========================================================================= */
@@ -289,7 +312,8 @@ void cdrom_audio_decode_xa(XaAdpcmState *xa, AudioFifo *fifo, const uint8_t *xa_
     /* No mute check here any more: muting only forces the *output* volume to
      * zero (cdromdrive.md:1018-1022), and returning early left the zigzag ring
      * and the six-step counter frozen, so the filter resumed from stale history
-     * on unmute. The mute is applied in cdrom_get_audio_frame(). */
+     * on unmute. Mute and ADPMUTE are applied to each frame the SPU takes out
+     * of the FIFO (spu_step -> cdrom_apply_output_volume). */
     uint32_t total_frames = (uint32_t)(18 * frames_per_chunk);
 
     /* ZS1_XA_DUMP=<path>: the decoded stream at its own rate, before the zigzag
@@ -327,8 +351,9 @@ void cdrom_audio_decode_xa(XaAdpcmState *xa, AudioFifo *fifo, const uint8_t *xa_
 
 void cdrom_audio_process_cdda(AudioFifo *fifo, const uint8_t *raw_sector) {
     /* Always pushed, muted or not: the mute is an output-volume control
-     * (cdromdrive.md:1018-1022), applied in cdrom_get_audio_frame(). Skipping
-     * the push starved the FIFO, which is a different sound from silence. */
+     * (cdromdrive.md:1018-1022), applied to each frame the SPU takes out of the
+     * FIFO (spu_step -> cdrom_apply_output_volume). Skipping the push starved
+     * the FIFO, which is a different sound from silence. */
     for (int i = 0; i < 588; i++) {
         int16_t l = (int16_t)((uint16_t)raw_sector[i*4+0] | ((uint16_t)raw_sector[i*4+1] << 8));
         int16_t r = (int16_t)((uint16_t)raw_sector[i*4+2] | ((uint16_t)raw_sector[i*4+3] << 8));

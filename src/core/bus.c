@@ -250,12 +250,14 @@ static void hw_irq_write(Interconnect* inter, uint32_t addr, uint32_t val, BusSi
             if (cleared & (1u << i)) LOG_IRQ_DEBUG("%s IRQ cleared", names[i]);
         inter->irq_status    &= wv;
         inter->irq_line_state &= wv;  // allow re-fire: next set_irq_line(true) is fresh edge
-        if ((cleared & (1u << IRQ_SPU)) && inter->spu.irq9_flag) {
-            inter->spu.irq9_flag  = false;
-            inter->spu.status    &= ~SPU_STATUS_IRQ9_FLAG;
-            interconnect_set_irq_line(inter, IRQ_SPU, false);
-            LOG_IRQ_DEBUG("SPU IRQ9 edge-trigger reset");
-        }
+        /* The SPU's own IRQ9 flag is not touched here. Interrupts other than
+         * IRQ0/4/5/6 "must be additionally acknowledged at the I/O port that
+         * has caused them" (psx-spx system/interrupts.md:34-36), and for the
+         * SPU that port is SPUCNT.6 = 0 (spu/soundprocessingunitspu.md:635,
+         * :655), handled in spu_set_control. Clearing the flag on the I_STAT
+         * write gave the SPU an extra acknowledge, so a handler that checked
+         * SPUSTAT.6 after acking I_STAT found it already clear. While the flag
+         * stays set the SPU raises no new edge, as on hardware. */
         if (inter->cpu) inter->cpu->downcount = 0;
     } else if (addr == IRQ_MASK_ADDR) {
         inter->irq_mask = (uint16_t)(val & 0x7FF);

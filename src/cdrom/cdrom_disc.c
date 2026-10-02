@@ -699,6 +699,18 @@ void cdrom_async_reader_queue(CdromAsyncReader *r, uint32_t lba) {
     pthread_mutex_unlock(&r->mutex);
 }
 
+/* Hand back the sector the last poll returned READY, so the next poll for the
+ * same LBA gets it again without another disc read. r->sector still holds it:
+ * the reader thread only overwrites the buffer when it has a new request, and
+ * this runs on the emulation thread right after the poll, before anything
+ * else could queue one. If something did, the sector is simply read again. */
+void cdrom_async_reader_unpoll(CdromAsyncReader *r, uint32_t lba) {
+    pthread_mutex_lock(&r->mutex);
+    if (!r->shutdown && !r->has_request && !r->busy && r->read_ok && r->ready_lba == lba)
+        r->sector_ready = true;
+    pthread_mutex_unlock(&r->mutex);
+}
+
 CdromSectorStatus cdrom_async_reader_poll(CdromAsyncReader *r, uint8_t *out_sector,
                                           uint32_t want_lba) {
     pthread_mutex_lock(&r->mutex);

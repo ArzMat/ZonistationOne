@@ -321,8 +321,9 @@ typedef struct Cdrom {
     bool muted;
     /* ADPCTL bit0 (cdromdrive.md:249-255). Mutes XA-ADPCM specifically, where
      * the Mute command mutes both CD-DA and XA. Both are applied at the output
-     * stage, because the audio FIFO carries one mixed stream and does not tag
-     * which sector a frame came from. */
+     * stage (cdrom_apply_output_volume). The audio FIFO carries one stream and
+     * does not tag which sector a frame came from, so ADPMUTE is applied
+     * whenever the drive is not playing CD-DA. */
     bool xa_mute;
 
     /* --- FIFOs --- */
@@ -387,8 +388,45 @@ void cdrom_execute_second_response(Cdrom *cdrom);
 bool cdrom_has_pending_command(Cdrom *cdrom);
 bool cdrom_has_pending_interrupt(Cdrom *cdrom);
 
-/* Audio frame for SPU/SDL (one stereo pair) */
+/* While the drive is reading and an interrupt is still unacknowledged:
+ * process the sector under the head if it goes to the ADPCM decoder or is
+ * discarded, and hold it if it is data (cdrom.c, cdrom_drive_event_tick). */
+void cdrom_execute_drive_int_pending(Cdrom *cdrom);
+
+/* Undo the consume of a READY cdrom_async_reader_poll() for `lba`, so the next
+ * poll returns the same sector without another disc read: the drive looked at
+ * the sector and has to hold it (data while an interrupt is pending). Lives in
+ * cdrom_disc.c beside the reader. */
+void cdrom_async_reader_unpoll(CdromAsyncReader *r, uint32_t lba);
+
+/* ZS1_CD_XA_HOLD=1, read once: the drive waits for every acknowledge before
+ * the next sector, XA included - the behaviour before the drive learned to
+ * keep feeding the ADPCM decoder while an interrupt is pending. An A/B switch. */
+bool cdrom_xa_hold_legacy(void);
+
+/* Where one sector read with ReadN/ReadS goes (psx-spx cdr/cdromdrive.md:
+ * 590-612). Pure: depends only on the sector bytes and the drive settings. */
+typedef enum {
+    CDROM_ROUTE_DATA,      /* INT1 + data FIFO, the GetlocL latch */
+    CDROM_ROUTE_ADPCM,     /* to the XA-ADPCM decoder, no INT1 */
+    CDROM_ROUTE_DISCARD    /* filtered audio: silently ignored */
+} CdromSectorRoute;
+
+CdromSectorRoute cdrom_route_sector(const uint8_t *raw, bool cdda_sector,
+                                    bool adpcm_enable, bool filter_enable,
+                                    uint8_t filter_file, uint8_t filter_channel);
+
+/* HSTS.2 ADPBUSY, "1=playing XA-ADPCM" (cdromdrive.md:62). */
+bool cdrom_xa_playing(const Cdrom *cdrom);
+
+/* Audio frame for SPU/SDL (one stereo pair): popped and passed through
+ * cdrom_apply_output_volume. */
 void cdrom_get_audio_frame(Cdrom *cdrom, int16_t *left, int16_t *right);
+
+/* The controller's output stage on one frame of the audio FIFO: Mute (both
+ * sources), ADPMUTE (XA only) and the ATV0-ATV3 matrix. The SPU applies it to
+ * every frame it takes from the FIFO. */
+void cdrom_apply_output_volume(const Cdrom *cdrom, int16_t *left, int16_t *right);
 
 /* DMA: read one 32-bit word from armed sector buffer (CDROM → RAM channel 3) */
 uint32_t cdrom_dma_read_word(Cdrom *cdrom);

@@ -174,8 +174,12 @@ typedef struct Gpu { // Define struct Gpu
     uint16_t vram_load_h;             // Height of the image being loaded
     uint32_t vram_load_count;         // Counter for pixels transferred during current load
 
-    // --- VRAM Dirty Tracking ---
-    bool vram_dirty;                  // True when CPU-side VRAM has been modified since last GPU upload
+    // --- VRAM Dirty Tracking (retired) ---
+    // Set by GP0(02h) to make the next textured primitive re-upload all of VRAM.
+    // A fill now reaches the renderer as an upload of its own rectangle, so
+    // nothing sets or reads it; the field stays so the saved Gpu span keeps
+    // its layout.
+    bool vram_dirty;
 
     // --- GP1 Info Latch (for GP1(0x10) GetGPUInfo responses) ---
     uint32_t gpu_info_latch;          // Data returned by GPUREAD after GP1(0x10) info request

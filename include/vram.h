@@ -82,5 +82,19 @@ uint8_t vram_load8(Vram* vram, uint32_t offset);
  */
 void vram_store8(Vram* vram, uint32_t offset, uint8_t value);
 
+/* --- Rectangles that wrap at the VRAM edges ---------------------------------
+ * Copy, fill and upload rectangles that run past the right or bottom edge wrap
+ * to the opposite edge, "without any carry-out from X to Y, nor from Y to X"
+ * (psx-spx gpu/memory-transfer-commands.md:95-98). The renderers take plain
+ * in-bounds rectangles, so a wrapped one is handed to them as up to four. */
+typedef struct {
+    uint16_t x, y, w, h;
+} VramRect;
+
+/* Split (x,y,w,h) into in-bounds pieces: x and y are taken modulo the VRAM size,
+ * w is clamped to 1..1024 and h to 1..512. Returns the number of pieces (0 for
+ * an empty rectangle, at most 4); out[0] always starts at (x,y). */
+int vram_split_rect(uint32_t x, uint32_t y, uint32_t w, uint32_t h, VramRect out[4]);
+
 
 #endif // VRAM_H

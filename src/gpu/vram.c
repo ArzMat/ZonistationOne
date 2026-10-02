@@ -107,3 +107,23 @@ void vram_store8(Vram* vram, uint32_t offset, uint8_t value) {
     }
     vram->data[offset] = value;
 }
+/* -------------------------------------------------------------------------
+ * Wrapped rectangles
+ * ---------------------------------------------------------------------- */
+
+int vram_split_rect(uint32_t x, uint32_t y, uint32_t w, uint32_t h, VramRect out[4]) {
+    if (w == 0 || h == 0) return 0;
+    x &= VRAM_WIDTH - 1;
+    y &= VRAM_HEIGHT - 1;
+    if (w > VRAM_WIDTH)  w = VRAM_WIDTH;
+    if (h > VRAM_HEIGHT) h = VRAM_HEIGHT;
+    const uint32_t w0 = (x + w > VRAM_WIDTH)  ? VRAM_WIDTH  - x : w;
+    const uint32_t h0 = (y + h > VRAM_HEIGHT) ? VRAM_HEIGHT - y : h;
+    const uint32_t w1 = w - w0, h1 = h - h0;
+    int n = 0;
+    out[n].x = (uint16_t)x; out[n].y = (uint16_t)y; out[n].w = (uint16_t)w0; out[n].h = (uint16_t)h0; n++;
+    if (w1) { out[n].x = 0; out[n].y = (uint16_t)y; out[n].w = (uint16_t)w1; out[n].h = (uint16_t)h0; n++; }
+    if (h1) { out[n].x = (uint16_t)x; out[n].y = 0; out[n].w = (uint16_t)w0; out[n].h = (uint16_t)h1; n++; }
+    if (w1 && h1) { out[n].x = 0; out[n].y = 0; out[n].w = (uint16_t)w1; out[n].h = (uint16_t)h1; n++; }
+    return n;
+}

@@ -22,8 +22,8 @@
 #include "interconnect.h"
 #include "lua_debug.h"
 #include "frame_events.h"
+#include <stddef.h>
 #include <string.h>
-#include <stdlib.h>
 #include <stdlib.h>
 
 // ---------------------------------------------------------------------------
@@ -139,14 +139,48 @@ static void vram_write_masked(Gpu* gpu, uint32_t offset, uint16_t pixel) {
     vram_store16(&gpu->vram, offset, pixel);
 }
 
+/* The CPU copy of VRAM as halfwords. Every renderer call already hands it over
+ * this way; the array is a byte array, so its offset in Gpu is checked here
+ * rather than assumed. */
+typedef char gpu_vram_is_halfword_aligned[(offsetof(Gpu, vram) % 2u == 0u) ? 1 : -1];
+static inline uint16_t* vram16(Gpu* gpu) { return (uint16_t*)(void*)gpu->vram.data; }
+
+/* ZS1_GPU_TRACE_BATCH, read once: it is tested on every completed GP0(A0h) and
+ * every GP0(C0h), and getenv() walks the whole environment each time. */
+static int trace_batch_enabled(void) {
+    static int cached = -1;
+    if (cached < 0) cached = getenv("ZS1_GPU_TRACE_BATCH") ? 1 : 0;
+    return cached;
+}
+
 // ---------------------------------------------------------------------------
-// Helper: upload VRAM only when dirty
+// Moving VRAM between the CPU copy and the renderer
+//
+// gpu.vram.data holds what the CPU, DMA and MDEC wrote; what the rasteriser
+// drew exists only in the renderer. GP0(80h) and GP0(C0h) need the real pixels,
+// so the rectangle is read back first, as its in-bounds pieces.
 // ---------------------------------------------------------------------------
-static inline void upload_vram_if_dirty(Gpu* gpu) {
-    if (gpu->vram_dirty) {
-        renderer_upload_vram(&gpu->renderer, (const uint16_t*)gpu->vram.data);
-        gpu->vram_dirty = false;
-    }
+
+/* Make the CPU copy authoritative for a (possibly wrapped) rectangle. */
+static void gpu_vram_pull(Gpu* gpu, uint32_t x, uint32_t y, uint32_t w, uint32_t h) {
+    VramRect p[4];
+    const int n = vram_split_rect(x, y, w, h, p);
+    for (int i = 0; i < n; i++)
+        renderer_read_vram_rect(&gpu->renderer, vram16(gpu), p[i].x, p[i].y, p[i].w, p[i].h);
+}
+
+/* Push a (possibly wrapped) rectangle of the CPU copy to the renderer. It goes
+ * as in-bounds pieces: the renderers copy w*h halfwords row by row from
+ * vram.data, so a rectangle hanging past line 511 used to read past the end of
+ * the buffer, and one past column 1023 wrote the wrong pixels
+ * (psx-spx gpu/memory-transfer-commands.md:95-98). renderer_upload_vram_rect()
+ * flushes the primitives still pending first, so the write keeps its place in
+ * the order. */
+static void gpu_vram_push(Gpu* gpu, uint32_t x, uint32_t y, uint32_t w, uint32_t h) {
+    VramRect p[4];
+    const int n = vram_split_rect(x, y, w, h, p);
+    for (int i = 0; i < n; i++)
+        renderer_upload_vram_rect(&gpu->renderer, vram16(gpu), p[i].x, p[i].y, p[i].w, p[i].h);
 }
 
 // ---------------------------------------------------------------------------
@@ -168,7 +202,6 @@ static void draw_rectangle(Gpu* gpu, int16_t x, int16_t y, uint16_t w, uint16_t 
 
     bool use_texture = textured && tex;
 
-    if (use_texture) upload_vram_if_dirty(gpu);
     // Rectangles NEVER dither (per PSX spec)
     renderer_set_dither_mode(&gpu->renderer, false);
     renderer_set_semi_trans_mode(&gpu->renderer, semi_trans, gpu->semi_transparency);
@@ -315,18 +348,12 @@ static void gp0_fill_rectangle(Gpu* gpu) {
     uint32_t pos_val   = gpu->gp0_command_buffer.buffer[1];
     uint32_t dim_val   = gpu->gp0_command_buffer.buffer[2];
 
-    RendererColor col = {
-        .r = (uint8_t)(color_val & 0xFF),
-        .g = (uint8_t)((color_val >> 8) & 0xFF),
-        .b = (uint8_t)((color_val >> 16) & 0xFF)
-    };
-
     // GPU-2 FIX: Fill rectangle coordinate masking per PSX-SPX docs:
     //   Xpos = Xpos AND 3F0h  (16-aligned, 10-bit)
     //   Ypos = Ypos AND 1FFh  (9-bit)
     //   Xsiz = ((Xsiz AND 3FFh) + 0Fh) AND NOT 0Fh  (rounded up to 16, max 0x400)
-    //   Ysiz = Ysiz AND 1FFh  (max 511 — a Ysiz=0 means no fill)
-    // Fill does NOT apply draw offset, NOT clipped by drawing area, NOT affected by mask bits.
+    //   Ysiz = Ysiz AND 1FFh  (max 511 - a Ysiz=0 means no fill)
+    // (psx-spx gpu/memory-transfer-commands.md:38-47)
     uint16_t x = (uint16_t)(pos_val & 0x3F0u);
     uint16_t y = (uint16_t)((pos_val >> 16) & 0x1FFu);
     uint16_t w = (uint16_t)(((dim_val & 0x3FFu) + 0x0Fu) & ~0x0Fu);
@@ -339,32 +366,33 @@ static void gp0_fill_rectangle(Gpu* gpu) {
     LOG_VRAM_DEBUG("Fill VRAM rectangle offset=(%u,%u), size=(%u,%u) color=%06x",
                    x, y, w, h, color_val & 0xFFFFFF);
 
-    // OpenGL render: fill rect uses absolute VRAM coords, no drawing offset.
-    // Renderer shader adds drawing_x/y_offset to all vertex coords, so we compensate.
-    renderer_set_semi_trans_mode(&gpu->renderer, false, 0); // fill: no semi-trans
-    int16_t adj_x = (int16_t)x - gpu->drawing_x_offset;
-    int16_t adj_y = (int16_t)y - gpu->drawing_y_offset;
-    draw_rectangle(gpu, adj_x, adj_y, w, h, col, false, false, NULL, 0, 0, false);
-
-    // Sync CPU-side VRAM. Fill:
-    //   - Absolute VRAM coords (no draw offset)
-    //   - Wraps at VRAM boundary (no carry between X and Y)
-    //   - Ignores drawing area clip
-    //   - Ignores mask bits (always writes bit15=0, regardless of force_set_mask_bit)
-    uint16_t r5 = (col.r >> 3) & 0x1Fu;
-    uint16_t g5 = (col.g >> 3) & 0x1Fu;
-    uint16_t b5 = (col.b >> 3) & 0x1Fu;
-    uint16_t pixel = r5 | (uint16_t)(g5 << 5) | (uint16_t)(b5 << 10); // bit15=0 (fill never sets mask)
-
+    /* "The hardware linearly converts the 24bit RGB value to 15bit RGB by
+     * dropping the lower 3 bits of each color value and additionally sets the
+     * mask bit (bit15) to 0", and "Rectangle filling is not affected by the
+     * GP0(E6h) mask setting" (psx-spx gpu/i-o-ports-dma-channels-commands-vram.md:86-91).
+     * Absolute VRAM coordinates, no drawing offset, no drawing area
+     * (memory-transfer-commands.md:85-87), wrapping at both edges with no carry
+     * between X and Y (:95-98). */
+    const uint16_t pixel = (uint16_t)(((color_val >> 3) & 0x1Fu) |
+                                      (((color_val >> 11) & 0x1Fu) << 5) |
+                                      (((color_val >> 19) & 0x1Fu) << 10));
+    uint16_t* const v = vram16(gpu);
+    const uint32_t first = ((uint32_t)x + w > VRAM_WIDTH) ? VRAM_WIDTH - x : w;
     for (uint32_t iy = 0; iy < (uint32_t)h; iy++) {
-        uint32_t vy = ((uint32_t)y + iy) & 0x1FFu;
-        for (uint32_t ix = 0; ix < (uint32_t)w; ix++) {
-            uint32_t vx = ((uint32_t)x + ix) & 0x3FFu;
-            uint32_t off = vy * VRAM_WIDTH * VRAM_BPP + vx * VRAM_BPP;
-            vram_store16(&gpu->vram, off, pixel); // Direct store — no mask bit check
-        }
+        uint16_t* row = v + (((uint32_t)y + iy) & 0x1FFu) * VRAM_WIDTH;
+        for (uint32_t ix = 0; ix < first; ix++) row[x + ix] = pixel;
+        for (uint32_t ix = first; ix < (uint32_t)w; ix++) row[ix - first] = pixel;
     }
-    gpu->vram_dirty = true;
+
+    /* The renderer gets the result as a VRAM write, not as a primitive. This
+     * used to draw a quad, which the renderer clips to the drawing area and
+     * passes through the mask settings like any primitive: a buffer cleared
+     * wider than the current drawing area (a 24bpp FMV buffer is 480 halfwords
+     * wide) stayed dirty on screen beyond it, and with GP0(E6h).0 set the fill
+     * came out with bit 15 on. It also never wrapped. As an upload it lands
+     * exactly as the CPU copy holds it, and the flush in the upload keeps it in
+     * order with the primitives around it. */
+    gpu_vram_push(gpu, x, y, w, h);
     lua_debug_notify("gp0_fill");
 }
 
@@ -618,7 +646,6 @@ static void gp0_tri_tex_impl(Gpu* gpu, bool semi_trans, bool raw_texture) {
         }
     }
 
-    upload_vram_if_dirty(gpu);
     // Dither: textured+blend (modulation) uses dithering; raw texture does not
     renderer_set_dither_mode(&gpu->renderer, gpu->dithering && !raw_texture);
     renderer_set_semi_trans_mode(&gpu->renderer, semi_trans, gpu->semi_transparency);
@@ -728,7 +755,6 @@ static void gp0_tri_shaded_tex_impl(Gpu* gpu, bool semi_trans, bool raw_texture)
         }
     }
 
-    upload_vram_if_dirty(gpu);
     // Shaded+textured blend: dither when enabled (gouraud + modulation)
     renderer_set_dither_mode(&gpu->renderer, gpu->dithering && !raw_texture);
     renderer_set_semi_trans_mode(&gpu->renderer, semi_trans, gpu->semi_transparency);
@@ -838,7 +864,6 @@ static void gp0_quad_tex_impl(Gpu* gpu, bool semi_trans, bool raw_texture) {
         }
     }
 
-    upload_vram_if_dirty(gpu);
     // Dither: textured+blend (modulation) uses dithering; raw texture does not
     renderer_set_dither_mode(&gpu->renderer, gpu->dithering && !raw_texture);
     renderer_set_semi_trans_mode(&gpu->renderer, semi_trans, gpu->semi_transparency);
@@ -947,7 +972,6 @@ static void gp0_quad_shaded_tex_impl(Gpu* gpu, bool semi_trans, bool raw_texture
         }
     }
 
-    upload_vram_if_dirty(gpu);
     // Shaded+textured quad: dither for blend mode (gouraud + modulation)
     renderer_set_dither_mode(&gpu->renderer, gpu->dithering && !raw_texture);
     renderer_set_semi_trans_mode(&gpu->renderer, semi_trans, gpu->semi_transparency);
@@ -1150,7 +1174,6 @@ static void gp0_rect_var_tex_impl(Gpu* gpu, bool semi_trans, bool raw_texture) {
         }
     }
 
-    upload_vram_if_dirty(gpu);
     draw_rectangle(gpu, x, y, w, h, col, true, raw_texture, &tex, clut, tpage, semi_trans);
 }
 
@@ -1205,7 +1228,6 @@ static void gp0_rect_fixed_tex_impl(Gpu* gpu, bool semi_trans, bool raw_texture,
         }
     }
 
-    upload_vram_if_dirty(gpu);
     draw_rectangle(gpu, x, y, size, size, col, true, raw_texture, &tex, clut, tpage, semi_trans);
 }
 
@@ -1251,29 +1273,34 @@ static void gp0_copy_rectangle(Gpu* gpu) {
 
     /* Same reason as GP0(0xC0): the source rect may be something the
      * rasterizer drew, which the CPU-side VRAM has never seen. */
-    renderer_read_vram_rect(&gpu->renderer, (uint16_t*)gpu->vram.data, src_x, src_y, w, h);
+    gpu_vram_pull(gpu, src_x, src_y, w, h);
+    /* "The mask setting affects all rendering commands, as well as CPU-to-VRAM
+     * and VRAM-to-VRAM transfer commands" (psx-spx gpu/rendering-attributes.md:
+     * 165-169). With GP0(E6h).1 set the test is against the destination's
+     * bit 15, which has to be the real one, not the CPU copy's. */
+    if (gpu->preserve_masked_pixels) gpu_vram_pull(gpu, dst_x, dst_y, w, h);
 
-    // Overlap-safe directional copy
+    // Overlap-safe directional copy, wrapping at the VRAM edges
+    // (psx-spx gpu/memory-transfer-commands.md:95-98)
+    uint16_t* const v = vram16(gpu);
+    const uint16_t set_mask = gpu->force_set_mask_bit ? 0x8000u : 0u;
+    const bool     test_mask = gpu->preserve_masked_pixels;
     int16_t step_x = 1, step_y = 1;
     int16_t start_x = 0, start_y = 0, end_x = w, end_y = h;
     if (dst_y > src_y) { step_y = -1; start_y = h - 1; end_y = -1; }
     if (dst_x > src_x) { step_x = -1; start_x = w - 1; end_x = -1; }
 
     for (int16_t y = start_y; y != end_y; y += step_y) {
+        const uint16_t* srow = v + (uint32_t)((src_y + y) & 0x1FF) * VRAM_WIDTH;
+        uint16_t*       drow = v + (uint32_t)((dst_y + y) & 0x1FF) * VRAM_WIDTH;
         for (int16_t x = start_x; x != end_x; x += step_x) {
-            uint16_t sx = (src_x + x) & 0x3FF;
-            uint16_t sy = (src_y + y) & 0x1FF;
-            uint16_t dx = (dst_x + x) & 0x3FF;
-            uint16_t dy = (dst_y + y) & 0x1FF;
-            uint32_t soff = (uint32_t)sy * VRAM_WIDTH * VRAM_BPP + (uint32_t)sx * VRAM_BPP;
-            uint32_t doff = (uint32_t)dy * VRAM_WIDTH * VRAM_BPP + (uint32_t)dx * VRAM_BPP;
-            uint16_t pixel = vram_load16(&gpu->vram, soff);
-            vram_write_masked(gpu, doff, pixel);
+            const uint16_t pixel = srow[(src_x + x) & 0x3FF];
+            uint16_t* d = &drow[(dst_x + x) & 0x3FF];
+            if (test_mask && (*d & 0x8000u)) continue;
+            *d = (uint16_t)(pixel | set_mask);
         }
     }
-    renderer_upload_vram_rect(&gpu->renderer, (const uint16_t*)gpu->vram.data,
-                              dst_x, dst_y, w, h);
-    gpu->vram_dirty = false;
+    gpu_vram_push(gpu, dst_x, dst_y, w, h);
     frame_events_record(FEV_VRAM_COPY, (uint32_t)w * h);
     lua_debug_notify("gp0_vram_copy");
 }
@@ -1362,6 +1389,14 @@ static void gp0_image_load(Gpu* gpu) {
         gpu->gp0_mode = GP0_MODE_COMMAND;
         return;
     }
+    /* With GP0(E6h).1 set an upload must not overwrite pixels whose bit 15 is
+     * set (psx-spx gpu/rendering-attributes.md:165-169), and the test is made
+     * per pixel against the CPU copy below. A pixel the rasteriser drew is not
+     * in the CPU copy, so the destination is brought back first. Only with the
+     * test on: without it the old contents do not matter. */
+    if (gpu->preserve_masked_pixels)
+        gpu_vram_pull(gpu, gpu->vram_load_x, gpu->vram_load_y, gpu->vram_load_w, gpu->vram_load_h);
+
     gpu->gp0_words_remaining = words;
     gpu->gp0_mode = GP0_MODE_IMAGE_LOAD;
     gpu->vram_load_count = 0;
@@ -1376,14 +1411,14 @@ static void gp0_image_store(Gpu* gpu) {
     }
     uint32_t val1 = gpu->gp0_command_buffer.buffer[1];
     uint32_t val2 = gpu->gp0_command_buffer.buffer[2];
+    /* "Masking for COPY Commands parameters": Xpos AND 3FFh, Ypos AND 1FFh,
+     * Xsiz=((Xsiz-1) AND 3FFh)+1, Ysiz=((Ysiz-1) AND 1FFh)+1 (psx-spx
+     * gpu/memory-transfer-commands.md:62-67). Sizes used to be clamped instead,
+     * so a raw Ysiz of 513 read 512 rows where hardware reads one. */
     uint16_t x = (uint16_t)(val1 & 0x3FF);
     uint16_t y = (uint16_t)((val1 >> 16) & 0x1FF);
-    uint16_t w = (uint16_t)(val2 & 0xFFFF);
-    uint16_t h = (uint16_t)(val2 >> 16);
-    if (x >= VRAM_WIDTH)  x = VRAM_WIDTH - 1;
-    if (y >= VRAM_HEIGHT) y = VRAM_HEIGHT - 1;
-    if (w == 0 || w > VRAM_WIDTH)  w = VRAM_WIDTH;
-    if (h == 0 || h > VRAM_HEIGHT) h = VRAM_HEIGHT;
+    uint16_t w = (uint16_t)((((val2 & 0xFFFFu) - 1u) & 0x3FFu) + 1u);
+    uint16_t h = (uint16_t)((((val2 >> 16) - 1u) & 0x1FFu) + 1u);
     gpu->vram_load_x = x; gpu->vram_load_y = y;
     gpu->vram_load_w = w; gpu->vram_load_h = h;
     uint32_t words = ((uint32_t)w * h + 1) / 2;
@@ -1394,13 +1429,14 @@ static void gp0_image_store(Gpu* gpu) {
     /* Pull the rendered pixels back before GPUREAD starts serving them. The
      * CPU-side VRAM only ever holds uploads; everything the rasterizer drew
      * lives in vram_tex. The BIOS menu draws its 3D objects, reads them back
-     * here, and re-uploads them as textures — without this it reads zeros and
-     * the objects vanish. */
-    renderer_read_vram_rect(&gpu->renderer, (uint16_t*)gpu->vram.data, x, y, w, h);
+     * here, and re-uploads them as textures; without this it reads zeros and
+     * the objects vanish. A rectangle that crosses an edge is read as its
+     * in-bounds pieces, and GPUREAD wraps the same way (gpu.c). */
+    gpu_vram_pull(gpu, x, y, w, h);
     LOG_GPU_DEBUG("[GPU] GP0(0xC0): VRAM->CPU START (%u,%u) %ux%u = %u words", x, y, w, h, words);
     LOG_VRAM_DEBUG("Copy rectangle from VRAM to CPU offset=(%u,%u), size=(%u,%u) [%u pixels, %u words] page=%u",
                    x, y, w, h, (uint32_t)w * h, words, x / 64);
-    if (getenv("ZS1_GPU_TRACE_BATCH") && w > 8)
+    if (trace_batch_enabled() && w > 8)
         LOG_GPU_INFO("[GPU] C0 readback <- (%u,%u) %ux%u  [page %u..%u]",
                      x, y, w, h, x / 64, (x + w - 1) / 64);
 }
@@ -1601,30 +1637,36 @@ static void gpu_gp0_handle_word(Gpu* gpu, uint32_t word) {
 
     // --- Image load mode ---
     if (gpu->gp0_mode == GP0_MODE_IMAGE_LOAD) {
-        uint16_t pixel1 = (uint16_t)(word & 0xFFFF);
-        uint16_t pixel2 = (uint16_t)(word >> 16);
+        /* Two pixels per word, row by row from (vram_load_x, vram_load_y),
+         * wrapping at the right and bottom edges of VRAM with no carry from X
+         * into Y (psx-spx gpu/memory-transfer-commands.md:95-98). Writes past
+         * column 1023 or line 511 used to be dropped.
+         *
+         * One divide per word: the column and row of the first pixel come from
+         * the same division (the compiler takes quotient and remainder from one
+         * instruction), the second pixel steps from there. */
+        const uint32_t w     = gpu->vram_load_w;
+        const uint32_t total = w * gpu->vram_load_h;
         uint32_t idx = gpu->vram_load_count;
-        uint32_t total = (uint32_t)gpu->vram_load_w * gpu->vram_load_h;
-
         if (idx < total) {
-            uint16_t x  = gpu->vram_load_x + (uint16_t)(idx % gpu->vram_load_w);
-            uint16_t y  = gpu->vram_load_y + (uint16_t)(idx / gpu->vram_load_w);
-            if (y < VRAM_HEIGHT && x < VRAM_WIDTH)
-                vram_write_masked(gpu, (uint32_t)y * VRAM_WIDTH * VRAM_BPP + (uint32_t)x * VRAM_BPP, pixel1);
-        }
-        idx++;
-        if (idx < total) {
-            uint16_t x  = gpu->vram_load_x + (uint16_t)(idx % gpu->vram_load_w);
-            uint16_t y  = gpu->vram_load_y + (uint16_t)(idx / gpu->vram_load_w);
-            if (y < VRAM_HEIGHT && x < VRAM_WIDTH)
-                vram_write_masked(gpu, (uint32_t)y * VRAM_WIDTH * VRAM_BPP + (uint32_t)x * VRAM_BPP, pixel2);
+            uint32_t col = idx % w, row = idx / w;
+            const bool plain = !gpu->force_set_mask_bit && !gpu->preserve_masked_pixels;
+            uint16_t* const v = vram16(gpu);
+            for (int k = 0; k < 2 && idx < total; k++, idx++) {
+                const uint16_t px  = k ? (uint16_t)(word >> 16) : (uint16_t)(word & 0xFFFF);
+                const uint32_t off = (((uint32_t)gpu->vram_load_y + row) & 0x1FFu) * VRAM_WIDTH
+                                   + (((uint32_t)gpu->vram_load_x + col) & 0x3FFu);
+                if (plain) v[off] = px;
+                else       vram_write_masked(gpu, off * VRAM_BPP, px);
+                if (++col == w) { col = 0; row++; }
+            }
         }
 
         gpu->vram_load_count += 2;
         gpu->gp0_words_remaining--;
         if (gpu->gp0_words_remaining == 0) {
             gpu->gp0_mode = GP0_MODE_COMMAND;
-            if (getenv("ZS1_GPU_TRACE_BATCH") && gpu->vram_load_w > 8) {
+            if (trace_batch_enabled() && gpu->vram_load_w > 8) {
                 LOG_GPU_INFO("[GPU] A0 mask state at completion: force_set=%d preserve=%d",
                              gpu->force_set_mask_bit, gpu->preserve_masked_pixels);
                 LOG_GPU_INFO("[GPU] A0 COMPLETE (%u,%u) %ux%u — %u of %u pixels written",
@@ -1632,10 +1674,8 @@ static void gpu_gp0_handle_word(Gpu* gpu, uint32_t word) {
                              gpu->vram_load_w, gpu->vram_load_h, gpu->vram_load_count,
                              (unsigned)((uint32_t)gpu->vram_load_w * gpu->vram_load_h));
             }
-            renderer_upload_vram_rect(&gpu->renderer, (const uint16_t*)gpu->vram.data,
-                                      gpu->vram_load_x, gpu->vram_load_y,
-                                      gpu->vram_load_w, gpu->vram_load_h);
-            gpu->vram_dirty = false;
+            gpu_vram_push(gpu, gpu->vram_load_x, gpu->vram_load_y,
+                          gpu->vram_load_w, gpu->vram_load_h);
             frame_events_record(FEV_VRAM_UPLOAD,
                                 (uint32_t)gpu->vram_load_w * gpu->vram_load_h);
             lua_debug_notify("gp0_vram_upload");
@@ -1664,6 +1704,14 @@ static void gpu_gp0_handle_word(Gpu* gpu, uint32_t word) {
          * the lines never drawn. Ace Combat 2 sends all three. */
         if ((opcode >> 5) == 0x2)
             opcode &= (uint8_t)~0x05u;
+        /* The three VRAM transfer commands are decoded from the top 3 bits
+         * alone: "For them, the remaining 29 bits are ignored, and can be set
+         * to any arbitrary value" (psx-spx gpu/memory-transfer-commands.md:3-5).
+         * The table only had A0h and C0h, so A1h..BFh and C1h..DFh were taken as
+         * unhandled one-word commands and the image data after them was
+         * interpreted as commands. */
+        else if (opcode >= 0x80 && opcode < 0xE0)
+            opcode &= 0xE0u;
 
         gpu->gp0_current_opcode = opcode;
         gpu_clear_cmd_buf(gpu);

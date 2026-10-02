@@ -38,6 +38,7 @@ for t in $tests; do
 
     for gfx in $backends; do
         log="$out/$t.$gfx.log"
+        : > "$log"
         (cd "$out" && SDL_AUDIODRIVER=dummy ZS1_LOG_STDERR=1 ZS1_GFX=$gfx \
             exec xvfb-run -a -s "-screen 0 1280x720x24" "$emu" zero_bios.bin --exe="$t.exe") > "$log" 2>&1 &
         pid=$!
